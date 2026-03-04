@@ -1,4 +1,4 @@
-name: Backup Ubuntu Runner Environment
+name: Backup Ubuntu Runner Environment to Artifacts
 
 on:
   workflow_dispatch:  # Run manually whenever you want a backup
