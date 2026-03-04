@@ -1,4 +1,4 @@
-name: Backup Ubuntu Runner to GDrive v1
+name: Backup Ubuntu Runner v1
 
 on:
   workflow_dispatch:  # Run manually whenever you want a backup
