@@ -1,9 +1,9 @@
-name: Backup Ubuntu Runner Environment to GDrive
+name: Backup Ubuntu Runner to GDrive v1
 
 on:
   workflow_dispatch:  # Run manually whenever you want a backup
-  schedule:
-    - cron: '0 2 * * 0'  # Optional: auto-run weekly on Sundays at 2am UTC
+  #schedule:
+    #- cron: '0 2 * * 0'  # Optional: auto-run weekly on Sundays at 2am UTC
 
 jobs:
   backup:
