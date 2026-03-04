@@ -247,9 +247,9 @@ jobs:
       - name: Print backup size breakdown
         run: |
           echo "===== Backup size breakdown ====="
-          du -sh backup/*/  | sort -rh
+          sudo du -sh backup/*/  | sort -rh
           echo "================================="
-          du -sh backup/
+          sudo du -sh backup/
 
       # ── 13. Generate restore.sh ───────────────────────────────────────────
       - name: Generate restore.sh
