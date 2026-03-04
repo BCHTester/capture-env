@@ -1,4 +1,4 @@
-name: Build Bootable Ubuntu ISO
+name: Build Bootable Ubuntu ISO v2
 
 on:
   workflow_dispatch:
