@@ -1,4 +1,4 @@
-name: Build Bootable Ubuntu ISO v6
+name: Build Bootable Ubuntu ISO
 
 on:
   workflow_dispatch:
@@ -7,49 +7,30 @@ on:
 
 jobs:
   build-iso:
-    runs-on: ubuntu-24.04   # Pin this — your ISO will match this exact Ubuntu version
-    timeout-minutes: 340    # ~5h40m — leaves buffer under the 6h Actions limit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 340
 
     steps:
-      # ── 0. Assess available disk space ────────────────────────────────────
-      # We do NOT delete anything. Instead we stage directly into the live-build
-      # tree (single copy, no intermediate /tmp duplication) and use /mnt for
-      # the live-build working directory, which is on a separate larger volume.
+      # ── 0. Show disk layout ────────────────────────────────────────────────
       - name: Show disk layout
+        continue-on-error: true
         run: |
-          echo "=== All mounts ==="
           df -h
-          echo ""
-          echo "=== Largest directories on / ==="
-          sudo du -sh /usr/* /opt/* /home/* 2>/dev/null | sort -rh | head -30
+          sudo du -sh /usr/local /usr/share /usr/lib /opt /home/runner 2>/dev/null | sort -rh
 
-      # ── 1. Install live-build and dependencies ─────────────────────────────
+      # ── 1. Install live-build ──────────────────────────────────────────────
       - name: Install live-build and tools
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y \
-            live-build \
-            debootstrap \
-            squashfs-tools \
-            xorriso \
-            grub-pc-bin \
-            grub-efi-amd64-bin \
-            mtools \
-            rsync \
-            genisoimage
+            live-build debootstrap squashfs-tools xorriso \
+            grub-pc-bin grub-efi-amd64-bin mtools rsync genisoimage
 
-      # ── 2. Initialise live-build ───────────────────────────────────────────
+      # ── 2. Initialise live-build config ───────────────────────────────────
       - name: Initialise live-build config
         run: |
-          # The runner has a single 145GB root partition with ~92GB free.
-          # We build in ~/live-build under the runner home directory.
           mkdir -p ~/live-build
           cd ~/live-build
-
-          # Note: live-build 3.0~a57 does not support --bootloaders (plural).
-          # Dual BIOS+UEFI boot is achieved by having both grub-efi-amd64-bin
-          # and grub-pc-bin installed — live-build detects and uses both
-          # automatically when building an iso-hybrid image.
           lb config \
             --mode ubuntu \
             --system live \
@@ -57,356 +38,235 @@ jobs:
             --archive-areas "main restricted universe multiverse" \
             --apt-recommends false \
             --binary-images iso-hybrid \
-            --debian-installer live \
-            --debian-installer-gui true \
             --memtest none \
             --linux-flavours generic \
             --bootappend-live "boot=live components locales=en_US.UTF-8 keyboard-layouts=us username=runner hostname=ubuntu-runner" \
             --iso-volume "Ubuntu-Runner-Backup" \
             --compression xz
 
-      # ── 3. Capture package list ────────────────────────────────────────────
-      - name: Capture installed package list
+      # ── 3. Inject package list ─────────────────────────────────────────────
+      # Dump all installed packages and let live-build's apt resolve what is
+      # actually available in the Ubuntu archive. Packages from third-party
+      # repos that are excluded below are already baked into includes.chroot
+      # via the /usr/local and /opt staging steps.
+      - name: Inject package list
         run: |
           mkdir -p ~/live-build/config/package-lists
-          # Full list of installed packages
-          dpkg --get-selections | awk '$2=="install"{print $1}' | sort \
-            > ~/live-build/config/package-lists/runner-packages.list.chroot
 
-          # Append live system essentials that must be present for a bootable ISO
-          cat >> ~/live-build/config/package-lists/runner-packages.list.chroot << 'EOF'
-          live-boot
-          live-config
-          live-config-systemd
-          ubiquity
-          ubiquity-frontend-gtk
-          network-manager
-          sudo
-          openssh-client
-          curl
-          wget
-          rsync
-          EOF
+          # Strip :amd64 arch suffixes so apt can resolve them cleanly
+          dpkg-query -W -f='${PackageSpec}\n' | sed 's/:amd64$//' | sort -u \
+            > ~/live-build/config/package-lists/runner.list.chroot
 
-          echo "Package list: $(wc -l < ~/live-build/config/package-lists/runner-packages.list.chroot) entries"
+          # Ensure live system essentials are present
+          for pkg in live-boot live-config live-config-systemd \
+                     network-manager sudo openssh-client curl wget rsync; do
+            grep -qx "$pkg" ~/live-build/config/package-lists/runner.list.chroot \
+              || echo "$pkg" >> ~/live-build/config/package-lists/runner.list.chroot
+          done
 
-      # ── 4. Inject apt sources and GPG keys ────────────────────────────────
-      - name: Inject apt sources and GPG keys
+          echo "Package list: $(wc -l < ~/live-build/config/package-lists/runner.list.chroot) entries"
+
+      # ── 4. Inject Ubuntu-only apt sources and keys ────────────────────────
+      # Third-party repos (Microsoft, Google, etc.) are intentionally excluded.
+      # Their GPG keys are not present inside the live-build chroot, causing
+      # apt to fail. Their packages are already in includes.chroot anyway.
+      - name: Inject Ubuntu apt sources and keys
         run: |
           mkdir -p ~/live-build/config/archives
 
-          echo "=== Injecting .list sources ==="
-          for f in /etc/apt/sources.list.d/*.list; do
-            [ -f "$f" ] && cp "$f" ~/live-build/config/archives/ && echo "  OK: $(basename $f)" || true
+          for f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+            [ -f "$f" ] || continue
+            if grep -qiE '(archive|security|ports|cloud-images)\.ubuntu\.com' "$f"; then
+              cp "$f" ~/live-build/config/archives/
+              echo "  included: $(basename "$f")"
+            else
+              echo "  skipped:  $(basename "$f")"
+            fi
           done
 
-          echo "=== Injecting .sources (DEB822) ==="
-          for f in /etc/apt/sources.list.d/*.sources; do
-            [ -f "$f" ] && cp "$f" ~/live-build/config/archives/ && echo "  OK: $(basename $f)" || true
+          for f in /usr/share/keyrings/ubuntu-*.gpg /usr/share/keyrings/ubuntu-*.asc; do
+            [ -f "$f" ] && cp "$f" ~/live-build/config/archives/ || true
           done
 
-          echo "=== Copying /usr/share/keyrings ==="
-          for f in /usr/share/keyrings/*.gpg /usr/share/keyrings/*.asc; do
-            [ -f "$f" ] && cp "$f" ~/live-build/config/archives/ && echo "  key: $(basename $f)" || true
-          done
+          echo "Archives:" && ls ~/live-build/config/archives/
 
-          echo "=== Copying /etc/apt/trusted.gpg.d ==="
-          for f in /etc/apt/trusted.gpg.d/*.gpg /etc/apt/trusted.gpg.d/*.asc; do
-            [ -f "$f" ] && cp "$f" ~/live-build/config/archives/ && echo "  key: $(basename $f)" || true
-          done
-
-          # Export ALL keys from the runner's apt keyring as individual .asc files.
-          # This captures keys like Microsoft's EB3E94ADBE1229CF that live in
-          # the legacy trusted keyring and aren't in individual files.
-          echo "=== Exporting keys from apt-key trusted keyring ==="
-          apt-key list 2>/dev/null | grep -E "^[/ ]" | tr -d " " |             while read fp; do
-              keyid="${fp: -16}"
-              if [ -n "$keyid" ]; then
-                gpg --batch --yes --no-default-keyring                   --keyring /etc/apt/trusted.gpg                   --export "$keyid" 2>/dev/null                   > ~/live-build/config/archives/trusted-${keyid}.gpg || true
-                # Remove empty export files
-                [ -s ~/live-build/config/archives/trusted-${keyid}.gpg ] ||                   rm -f ~/live-build/config/archives/trusted-${keyid}.gpg
-              fi
-            done
-
-          echo "=== Archives dir contents ==="
-          ls ~/live-build/config/archives/
-
-      # ── 5. Stage /etc directly into includes.chroot ───────────────────────
+      # ── 5. Stage /etc ─────────────────────────────────────────────────────
       - name: Stage /etc into ISO rootfs
         run: |
           INCLUDES=~/live-build/config/includes.chroot
           mkdir -p "$INCLUDES/etc"
-
-          # Write apt config to allow unauthenticated repos BEFORE staging /etc,
-          # so it's present in the chroot before apt runs at all.
-          # This handles third-party repos (Microsoft etc.) with key issues.
-          mkdir -p "$INCLUDES/etc/apt/apt.conf.d"
-          printf 'APT::Get::AllowUnauthenticated "true";\nAcquire::AllowInsecureRepositories "true";\nAcquire::AllowDowngradeToInsecureRepositories "true";\n' \
-            > "$INCLUDES/etc/apt/apt.conf.d/99-live-build-insecure"
-
-          # Copy full /etc, skipping only credentials and machine-specific
-          # network config that would break a different machine
           sudo rsync -a --ignore-errors \
-            --exclude='shadow' \
-            --exclude='shadow-' \
-            --exclude='gshadow' \
-            --exclude='gshadow-' \
-            --exclude='ssl/private/' \
-            --exclude='hostname' \
-            --exclude='hosts' \
-            --exclude='resolv.conf' \
-            --exclude='netplan/' \
-            --exclude='network/' \
-            --exclude='NetworkManager/' \
-            --exclude='apt/' \
+            --exclude='shadow'           \
+            --exclude='shadow-'          \
+            --exclude='gshadow'          \
+            --exclude='gshadow-'         \
+            --exclude='ssl/private/'     \
+            --exclude='hostname'         \
+            --exclude='hosts'            \
+            --exclude='resolv.conf'      \
+            --exclude='netplan/'         \
+            --exclude='network/'         \
+            --exclude='NetworkManager/'  \
+            --exclude='apt/'             \
             /etc/ "$INCLUDES/etc/" 2>/dev/null || true
+          echo "/etc: $(sudo find $INCLUDES/etc -type f 2>/dev/null | wc -l) files"
 
-          echo "/etc staged: $(find $INCLUDES/etc -type f | wc -l) files"
-
-      # ── 6. Stage /usr/local directly into includes.chroot ─────────────────
+      # ── 6. Stage /usr/local ───────────────────────────────────────────────
       - name: Stage /usr/local into ISO rootfs
         run: |
           INCLUDES=~/live-build/config/includes.chroot
           mkdir -p "$INCLUDES/usr/local"
-
           sudo rsync -a --ignore-errors \
-            --exclude='*.pyc' \
-            --exclude='__pycache__/' \
+            --exclude='*.pyc' --exclude='__pycache__/' \
             /usr/local/ "$INCLUDES/usr/local/" 2>/dev/null || true
+          echo "/usr/local: $(sudo du -sh $INCLUDES/usr/local/ 2>/dev/null | cut -f1)"
 
-          echo "/usr/local staged: $(sudo du -sh $INCLUDES/usr/local/ 2>/dev/null | cut -f1 || echo unknown)"
-
-      # ── 7. Stage /opt directly into includes.chroot ───────────────────────
+      # ── 7. Stage /opt ─────────────────────────────────────────────────────
       - name: Stage /opt into ISO rootfs
         run: |
           INCLUDES=~/live-build/config/includes.chroot
           mkdir -p "$INCLUDES/opt"
-
           sudo rsync -a --ignore-errors \
-            --exclude='*.pyc' \
-            --exclude='__pycache__/' \
+            --exclude='*.pyc' --exclude='__pycache__/' \
             /opt/ "$INCLUDES/opt/" 2>/dev/null || true
+          echo "/opt: $(sudo du -sh $INCLUDES/opt/ 2>/dev/null | cut -f1)"
 
-          echo "/opt staged: $(sudo du -sh $INCLUDES/opt/ 2>/dev/null | cut -f1 || echo unknown)"
-
-      # ── 8. Stage language toolchains ──────────────────────────────────────
-      - name: Stage language toolchains into ISO rootfs
+      # ── 8. Stage language toolchains into /etc/skel ───────────────────────
+      - name: Stage language toolchains
         run: |
           INCLUDES=~/live-build/config/includes.chroot
-
-          # JVM — goes directly to its system path
-          if [ -d /usr/lib/jvm ]; then
-            mkdir -p "$INCLUDES/usr/lib/jvm"
-            sudo rsync -a --ignore-errors /usr/lib/jvm/ "$INCLUDES/usr/lib/jvm/" 2>/dev/null || true
-            echo "JVM: $(sudo du -sh $INCLUDES/usr/lib/jvm/ 2>/dev/null | cut -f1 || echo unknown)"
-          fi
-
-          # User-level toolchains go into /etc/skel so they're applied to
-          # every user created during install
           SKEL="$INCLUDES/etc/skel"
           mkdir -p "$SKEL"
 
+          if [ -d /usr/lib/jvm ]; then
+            mkdir -p "$INCLUDES/usr/lib/jvm"
+            sudo rsync -a --ignore-errors /usr/lib/jvm/ "$INCLUDES/usr/lib/jvm/" 2>/dev/null || true
+          fi
+
           for pair in \
-            "$HOME/.cargo:.cargo" \
+            "$HOME/.cargo:.cargo"   \
             "$HOME/.rustup:.rustup" \
-            "$HOME/.nvm:.nvm" \
-            "$HOME/.volta:.volta" \
-            "$HOME/.pyenv:.pyenv" \
-            "$HOME/.rbenv:.rbenv" \
+            "$HOME/.nvm:.nvm"       \
+            "$HOME/.volta:.volta"   \
+            "$HOME/.pyenv:.pyenv"   \
+            "$HOME/.rbenv:.rbenv"   \
             "$HOME/.rvm:.rvm"; do
             src="${pair%%:*}"
             dst="${pair##*:}"
             if [ -d "$src" ]; then
               rsync -a --ignore-errors "$src/" "$SKEL/$dst/" 2>/dev/null || true
-              echo "$dst: $(du -sh $SKEL/$dst/ 2>/dev/null | cut -f1 || echo unknown)"
+              echo "  $dst: $(du -sh $SKEL/$dst/ 2>/dev/null | cut -f1 || echo 0)"
             fi
           done
 
-      # ── 9. Stage home dotfiles and ~/.config into /etc/skel ───────────────
-      - name: Stage home dotfiles into /etc/skel
+      # ── 9. Stage home dotfiles into /etc/skel ─────────────────────────────
+      - name: Stage home dotfiles
         run: |
           SKEL=~/live-build/config/includes.chroot/etc/skel
+          mkdir -p "$SKEL"
 
-          # All dotfiles in ~/
           find ~ -maxdepth 1 -name '.*' -type f \
-            ! -name '.bash_history' \
-            ! -name '.lesshst' \
-            ! -name '.viminfo' \
-            | while read f; do
-                cp "$f" "$SKEL/$(basename "$f")" 2>/dev/null || true
-              done
+            ! -name '.bash_history' ! -name '.lesshst' ! -name '.viminfo' \
+            -exec cp {} "$SKEL/" \; 2>/dev/null || true
 
-          # Full ~/.config
-          if [ -d ~/.config ]; then
-            rsync -a --ignore-errors \
-              --exclude='*/Cache/' \
-              --exclude='*/CacheStorage/' \
-              --exclude='google-chrome/' \
-              --exclude='chromium/' \
-              ~/.config/ "$SKEL/.config/" 2>/dev/null || true
-          fi
+          [ -d ~/.config ] && rsync -a --ignore-errors \
+            --exclude='*/Cache/' --exclude='*/CacheStorage/' \
+            --exclude='google-chrome/' --exclude='chromium/' \
+            ~/.config/ "$SKEL/.config/" 2>/dev/null || true
 
-          # ~/.local/share
-          if [ -d ~/.local/share ]; then
-            rsync -a --ignore-errors \
-              --exclude='Trash/' \
-              --exclude='*/Cache/' \
-              ~/.local/share/ "$SKEL/.local/share/" 2>/dev/null || true
-          fi
+          [ -d ~/.local/share ] && rsync -a --ignore-errors \
+            --exclude='Trash/' --exclude='*/Cache/' \
+            ~/.local/share/ "$SKEL/.local/share/" 2>/dev/null || true
 
-          echo "skel dotfiles: $(ls -A $SKEL | wc -l) entries"
-          echo "skel total:    $(sudo du -sh $SKEL 2>/dev/null | cut -f1 || echo unknown)"
+          echo "skel: $(du -sh $SKEL 2>/dev/null | cut -f1)"
 
-      # ── 10a. Create pre-install hook to fix GPG keys inside chroot ──────────
-      - name: Create pre-install GPG key fix hook
+      # ── 10. Write chroot fixup hook ────────────────────────────────────────
+      # Written via Python to avoid all YAML/shell heredoc quoting issues.
+      - name: Create chroot fixup hook
         run: |
           mkdir -p ~/live-build/config/hooks/live
+          python3 - << 'PYEOF'
+          import os, stat
 
-          # This hook runs BEFORE package installation inside the chroot.
-          # It imports all .gpg key files we staged into /etc/apt/trusted.gpg.d/
-          # and configures apt to treat signature failures as warnings, not errors.
-          # This handles third-party repos (Microsoft, Google, etc.) whose keys
-          # may not be correctly wired up by live-build automatically.
-          cat > ~/live-build/config/hooks/live/0050-fix-apt-keys.hook.chroot << 'HOOK'
-          #!/bin/bash
-          set -e
+          hook = (
+              '#!/bin/bash\n'
+              'set -e\n'
+              '\n'
+              '# Rebuild dynamic linker cache after /usr/local libs were placed\n'
+              'ldconfig\n'
+              '\n'
+              '# Ensure /usr/local/bin is in system-wide PATH\n'
+              'echo \'PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"\' > /etc/environment\n'
+              '\n'
+              '# Fix ownership of runner home if the user exists\n'
+              'id runner &>/dev/null && chown -R runner:runner /home/runner 2>/dev/null || true\n'
+              '\n'
+              '# Add toolchain init lines to /etc/skel/.bashrc\n'
+              'SBRC=/etc/skel/.bashrc\n'
+              'touch "$SBRC"\n'
+              '\n'
+              'if [ -d /etc/skel/.cargo ]; then\n'
+              '  grep -q cargo/env "$SBRC" || echo \'. "$HOME/.cargo/env"\' >> "$SBRC"\n'
+              'fi\n'
+              '\n'
+              'if [ -d /etc/skel/.nvm ]; then\n'
+              '  if ! grep -q NVM_DIR "$SBRC"; then\n'
+              '    printf \'export NVM_DIR="$HOME/.nvm"\\n[ -s "$NVM_DIR/nvm.sh" ] && \\\\. "$NVM_DIR/nvm.sh"\\n\' >> "$SBRC"\n'
+              '  fi\n'
+              'fi\n'
+              '\n'
+              'if [ -d /etc/skel/.pyenv ]; then\n'
+              '  if ! grep -q pyenv "$SBRC"; then\n'
+              '    printf \'export PYENV_ROOT="$HOME/.pyenv"\\nexport PATH="$PYENV_ROOT/bin:$PATH"\\neval "$(pyenv init -)"\n\' >> "$SBRC"\n'
+              '  fi\n'
+              'fi\n'
+              '\n'
+              'if [ -d /etc/skel/.rbenv ]; then\n'
+              '  grep -q rbenv "$SBRC" || echo \'eval "$(~/.rbenv/bin/rbenv init - bash)"\' >> "$SBRC"\n'
+              'fi\n'
+          )
 
-          echo "=== Importing staged GPG keys into chroot trusted keyring ==="
-          mkdir -p /etc/apt/trusted.gpg.d/
+          path = os.path.expanduser(
+              '~/live-build/config/hooks/live/0100-fixup.hook.chroot'
+          )
+          with open(path, 'w') as f:
+              f.write(hook)
+          os.chmod(path, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+          print('Hook written OK')
+          PYEOF
 
-          # Import any .gpg files that live-build staged into /etc/apt/
-          for f in /etc/apt/*.gpg /etc/apt/trusted.gpg.d/*.gpg; do
-            [ -f "$f" ] || continue
-            echo "  Importing: $(basename $f)"
-            cp "$f" /etc/apt/trusted.gpg.d/ 2>/dev/null || true
-          done
-
-          # Also accept the Microsoft key by its known fingerprint directly
-          # This is the key for packages.microsoft.com (EB3E94ADBE1229CF)
-          if command -v gpg &>/dev/null; then
-            gpg --batch --yes --keyserver hkps://keyserver.ubuntu.com               --recv-keys EB3E94ADBE1229CF 2>/dev/null || true
-            gpg --batch --yes --export EB3E94ADBE1229CF               > /etc/apt/trusted.gpg.d/microsoft.gpg 2>/dev/null || true
-          fi
-
-          # Configure apt to downgrade auth errors to warnings so one bad
-          # third-party repo cannot abort the entire package install phase
-          cat > /etc/apt/apt.conf.d/99-allow-unauthenticated << 'APT'
-          APT::Get::AllowUnauthenticated "true";
-          Acquire::AllowInsecureRepositories "true";
-          Acquire::AllowDowngradeToInsecureRepositories "true";
-          APT
-
-          echo "=== APT key import complete ==="
-          HOOK
-          chmod +x ~/live-build/config/hooks/live/0050-fix-apt-keys.hook.chroot
-
-      # ── 10. Create ldconfig hook (needed after /usr/local is placed) ───────
-      - name: Create chroot hook for ldconfig and PATH fixups
-        run: |
-          mkdir -p ~/live-build/config/hooks/live
-
-          cat > ~/live-build/config/hooks/live/0100-fixup.hook.chroot << 'HOOK'
-          #!/bin/bash
-          set -e
-
-          # Rebuild the dynamic linker cache after /usr/local libs were placed
-          ldconfig
-
-          # Ensure /usr/local/bin is in the system-wide PATH
-          echo 'PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"' \
-            > /etc/environment
-
-          # Make sure the runner user exists and owns their home toolchains
-          if id runner &>/dev/null; then
-            chown -R runner:runner /home/runner 2>/dev/null || true
-          fi
-
-          # If cargo/rustup/nvm etc. are in skel, add their init lines to
-          # /etc/skel/.bashrc so they activate on login
-          SKEL_BASHRC=/etc/skel/.bashrc
-
-          # Rust
-          if [ -d /etc/skel/.cargo ]; then
-            grep -q 'cargo/env' "$SKEL_BASHRC" 2>/dev/null || \
-              echo '. "$HOME/.cargo/env"' >> "$SKEL_BASHRC"
-          fi
-
-          # nvm
-          if [ -d /etc/skel/.nvm ]; then
-            grep -q 'NVM_DIR' "$SKEL_BASHRC" 2>/dev/null || cat >> "$SKEL_BASHRC" << 'NVM'
-          export NVM_DIR="$HOME/.nvm"
-          [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
-          [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"
-          NVM
-          fi
-
-          # pyenv
-          if [ -d /etc/skel/.pyenv ]; then
-            grep -q 'pyenv' "$SKEL_BASHRC" 2>/dev/null || cat >> "$SKEL_BASHRC" << 'PYENV'
-          export PYENV_ROOT="$HOME/.pyenv"
-          command -v pyenv >/dev/null || export PATH="$PYENV_ROOT/bin:$PATH"
-          eval "$(pyenv init -)"
-          PYENV
-          fi
-
-          # rbenv
-          if [ -d /etc/skel/.rbenv ]; then
-            grep -q 'rbenv' "$SKEL_BASHRC" 2>/dev/null || \
-              echo 'eval "$(~/.rbenv/bin/rbenv init - bash)"' >> "$SKEL_BASHRC"
-          fi
-          HOOK
-
-          chmod +x ~/live-build/config/hooks/live/0100-fixup.hook.chroot
-
-      # ── 11. Show disk state before the expensive build step ───────────────
+      # ── 11. Pre-build disk check ───────────────────────────────────────────
       - name: Show disk state before build
-        # continue-on-error so permission-denied from root-owned /etc subdirs
-        # cannot abort the job — this step is purely informational
         continue-on-error: true
         run: |
-          echo "=== Disk layout ==="
           df -h
-          echo ""
-          echo "=== live-build includes size ==="
-          sudo du -sh ~/live-build/config/includes.chroot/*/  2>/dev/null | sort -rh
-          echo ""
-          echo "=== Total live-build tree ==="
-          sudo du -sh ~/live-build/ 2>/dev/null || true
+          sudo du -sh ~/live-build/config/includes.chroot/*/ 2>/dev/null | sort -rh || true
+          echo "live-build total: $(sudo du -sh ~/live-build/ 2>/dev/null | cut -f1)"
 
       # ── 12. Build the ISO ──────────────────────────────────────────────────
       - name: Build ISO
         working-directory: /home/runner/live-build
         run: |
-          echo "Starting live-build — typically takes 30–90 minutes..."
           sudo lb build 2>&1 | tee /tmp/live-build.log
-          echo ""
           echo "=== ISO output ==="
           ls -lh ~/live-build/*.iso ~/live-build/live-image*.hybrid.iso 2>/dev/null
 
-      - name: Name ISO with timestamp and verify
+      # ── 13. Name ISO and generate checksum ────────────────────────────────
+      - name: Name ISO and generate checksum
         run: |
           TIMESTAMP=$(date -u +"%Y-%m-%dT%H-%M-%SZ")
           OS_VERSION=$(lsb_release -rs 2>/dev/null || echo "24.04")
           ISO_NAME="ubuntu-runner-${OS_VERSION}-${TIMESTAMP}.iso"
-
           ISO_SRC=$(ls ~/live-build/*.iso ~/live-build/live-image*.hybrid.iso 2>/dev/null | head -1)
-          if [ -z "$ISO_SRC" ]; then
-            echo "ERROR: No ISO file found — build may have failed. Check the build log artifact."
-            exit 1
-          fi
-
+          [ -z "$ISO_SRC" ] && echo "ERROR: no ISO found" && exit 1
           mv "$ISO_SRC" "$HOME/${ISO_NAME}"
-          ISO_SIZE=$(du -sh "$HOME/${ISO_NAME}" 2>/dev/null | cut -f1 || echo unknown)
-          echo "ISO: ${ISO_NAME}  (${ISO_SIZE})"
-
-          # Generate SHA256 checksum alongside the ISO
           sha256sum "$HOME/${ISO_NAME}" > "$HOME/${ISO_NAME}.sha256"
-
           echo "ISO_FILE=$HOME/${ISO_NAME}"       >> $GITHUB_ENV
           echo "ISO_SHA=$HOME/${ISO_NAME}.sha256"  >> $GITHUB_ENV
-          echo "ISO_NAME=${ISO_NAME}"             >> $GITHUB_ENV
+          echo "ISO_NAME=${ISO_NAME}"              >> $GITHUB_ENV
+          echo "Built: ${ISO_NAME} ($(du -sh $HOME/${ISO_NAME} | cut -f1))"
 
-      # ── 13. Upload ISO + checksum to Google Drive ─────────────────────────
+      # ── 14. Upload to Google Drive ─────────────────────────────────────────
       - name: Install rclone
         run: curl https://rclone.org/install.sh | sudo bash
 
@@ -418,31 +278,34 @@ jobs:
           GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GDRIVE_ROOT_FOLDER_ID }}
         run: |
           mkdir -p ~/.config/rclone
-          cat > ~/.config/rclone/rclone.conf << EOF
-          [gdrive]
-          type = drive
-          client_id = ${GDRIVE_CLIENT_ID}
-          client_secret = ${GDRIVE_CLIENT_SECRET}
-          token = ${GDRIVE_TOKEN}
-          root_folder_id = ${GDRIVE_ROOT_FOLDER_ID}
-          EOF
+          python3 - << 'PYEOF'
+          import os
+          lines = [
+              '[gdrive]',
+              'type = drive',
+              'client_id = ' + os.environ['GDRIVE_CLIENT_ID'],
+              'client_secret = ' + os.environ['GDRIVE_CLIENT_SECRET'],
+              'token = ' + os.environ['GDRIVE_TOKEN'],
+              'root_folder_id = ' + os.environ['GDRIVE_ROOT_FOLDER_ID'],
+          ]
+          path = os.path.expanduser('~/.config/rclone/rclone.conf')
+          with open(path, 'w') as f:
+              f.write('\n'.join(lines) + '\n')
+          print('rclone config written')
+          PYEOF
 
       - name: Upload ISO and checksum to Google Drive
         run: |
-          echo "Uploading ${{ env.ISO_NAME }}..."
           rclone copy "${{ env.ISO_FILE }}" gdrive:github-iso-builds \
-            --drive-chunk-size 256M \
-            --transfers 1 \
-            --progress \
-            --stats 30s
+            --drive-chunk-size 256M --transfers 1 --progress --stats 30s
           rclone copy "${{ env.ISO_SHA }}" gdrive:github-iso-builds
-          echo "✅ Uploaded to Google Drive → github-iso-builds/${{ env.ISO_NAME }}"
+          echo "Uploaded: github-iso-builds/${{ env.ISO_NAME }}"
 
       - name: Clean up rclone config
         if: always()
         run: rm -f ~/.config/rclone/rclone.conf
 
-      # ── 14. Upload build log as artifact ──────────────────────────────────
+      # ── 15. Upload build log ───────────────────────────────────────────────
       - name: Upload build log
         if: always()
         uses: actions/upload-artifact@v4
