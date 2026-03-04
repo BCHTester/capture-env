@@ -1,0 +1,458 @@
+name: Backup Ubuntu Runner Environment
+
+on:
+  workflow_dispatch:  # Run manually whenever you want a backup
+  schedule:
+    - cron: '0 2 * * 0'  # Optional: auto-run weekly on Sundays at 2am UTC
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    # Pin to a specific version to ensure your restore target matches exactly:
+    # runs-on: ubuntu-24.04
+
+    steps:
+      # ── 1. Installed packages ──────────────────────────────────────────────
+      - name: Capture installed apt packages
+        run: |
+          mkdir -p backup/packages
+          dpkg --get-selections > backup/packages/dpkg-selections.txt
+          apt-mark showmanual   > backup/packages/apt-manual.txt
+          apt-mark showauto     > backup/packages/apt-auto.txt
+
+      - name: Capture snap packages
+        run: |
+          snap list --all > backup/packages/snap-list.txt 2>/dev/null || echo "(no snaps)" > backup/packages/snap-list.txt
+
+      - name: Capture pip packages (all Python versions)
+        run: |
+          for py in python3 python3.10 python3.11 python3.12; do
+            if command -v $py &>/dev/null; then
+              $py -m pip freeze 2>/dev/null > backup/packages/pip-${py}.txt || true
+            fi
+          done
+
+      - name: Capture npm global packages
+        run: |
+          npm list -g --depth=0 2>/dev/null > backup/packages/npm-global.txt || echo "(npm not found)" > backup/packages/npm-global.txt
+
+      - name: Capture gem packages (Ruby)
+        run: |
+          gem list 2>/dev/null > backup/packages/gem-list.txt || echo "(gem not found)" > backup/packages/gem-list.txt
+
+      # ── 2. System info ────────────────────────────────────────────────────
+      - name: Capture system info
+        run: |
+          mkdir -p backup/system
+          uname -a                > backup/system/uname.txt
+          lsb_release -a        >> backup/system/uname.txt 2>/dev/null
+          cat /etc/os-release     > backup/system/os-release.txt
+          timedatectl status      > backup/system/timezone.txt 2>/dev/null || true
+          locale                  > backup/system/locale.txt
+          cat /etc/locale.gen   >> backup/system/locale.txt 2>/dev/null || true
+          sysctl -a 2>/dev/null   > backup/system/sysctl.txt || true
+          df -h                   > backup/system/df.txt
+          lsblk -o NAME,SIZE,TYPE,MOUNTPOINT > backup/system/lsblk.txt
+          cat /etc/fstab          > backup/system/fstab.txt
+
+      - name: Capture crontabs
+        run: |
+          mkdir -p backup/cron
+          crontab -l 2>/dev/null > backup/cron/user-crontab.txt || echo "(no user crontab)" > backup/cron/user-crontab.txt
+          cp -r /etc/cron.d/      backup/cron/cron.d/      2>/dev/null || true
+          cp -r /etc/cron.daily/  backup/cron/cron.daily/  2>/dev/null || true
+          cp -r /etc/cron.weekly/ backup/cron/cron.weekly/ 2>/dev/null || true
+
+      # ── 3. Full /etc ───────────────────────────────────────────────────────
+      - name: Capture full /etc directory
+        run: |
+          mkdir -p backup/etc
+          sudo rsync -a --ignore-errors \
+            --exclude='shadow' \
+            --exclude='shadow-' \
+            --exclude='gshadow' \
+            --exclude='gshadow-' \
+            --exclude='ssl/private/' \
+            /etc/ backup/etc/ 2>/dev/null || true
+          echo "$(find backup/etc -type f | wc -l) files captured from /etc"
+
+      # ── 4. Environment & shell config ─────────────────────────────────────
+      - name: Capture environment variables
+        run: |
+          mkdir -p backup/env
+          env | grep -v -iE '(token|secret|key|password|credential|auth)' | sort > backup/env/environment.txt
+          echo "# WARNING: Review and remove sensitive values before restoring" >> backup/env/environment.txt
+
+      - name: Capture PATH and tool versions
+        run: |
+          echo "PATH=$PATH" > backup/env/path.txt
+          {
+            echo "=== Key tool versions ===";
+            bash --version | head -1;
+            python3 --version 2>/dev/null || true;
+            node --version    2>/dev/null || true;
+            npm --version     2>/dev/null || true;
+            ruby --version    2>/dev/null || true;
+            go version        2>/dev/null || true;
+            java -version 2>&1 | head -1 || true;
+            docker --version  2>/dev/null || true;
+            git --version     2>/dev/null || true;
+          } > backup/env/tool-versions.txt
+
+      # ── 5. Systemd services ────────────────────────────────────────────────
+      - name: Capture systemd service state
+        run: |
+          mkdir -p backup/services/custom-units
+          systemctl list-units --type=service --all --no-pager          > backup/services/services-all.txt     2>/dev/null || true
+          systemctl list-units --type=service --state=enabled --no-pager > backup/services/services-enabled.txt 2>/dev/null || true
+          cp /etc/systemd/system/*.service backup/services/custom-units/ 2>/dev/null || true
+
+      # ── 6. Users and groups ────────────────────────────────────────────────
+      - name: Capture users and groups
+        run: |
+          mkdir -p backup/users
+          cat /etc/passwd > backup/users/passwd.txt
+          cat /etc/group  > backup/users/group.txt
+
+      # ── 7. Network configuration ───────────────────────────────────────────
+      - name: Capture network config
+        run: |
+          mkdir -p backup/network
+          ip addr show             > backup/network/ip-addr.txt
+          ip route show            > backup/network/ip-route.txt
+          ss -tuln                 > backup/network/open-ports.txt
+          cat /etc/netplan/*.yaml  > backup/network/netplan.yaml 2>/dev/null || true
+
+      # ── 8. /usr/local — custom-installed binaries & libraries ─────────────
+      - name: Capture /usr/local
+        run: |
+          mkdir -p backup/usr-local
+          sudo rsync -a --ignore-errors \
+            --exclude='*.pyc' \
+            --exclude='__pycache__/' \
+            /usr/local/ backup/usr-local/ 2>/dev/null || true
+          echo "$(du -sh backup/usr-local/ | cut -f1) captured from /usr/local"
+
+      # ── 9. /opt — third-party SDKs and tools ──────────────────────────────
+      - name: Capture /opt
+        run: |
+          mkdir -p backup/opt
+          sudo rsync -a --ignore-errors \
+            --exclude='*.pyc' \
+            --exclude='__pycache__/' \
+            /opt/ backup/opt/ 2>/dev/null || true
+          echo "$(du -sh backup/opt/ | cut -f1) captured from /opt"
+
+      # ── 10. Language toolchains ────────────────────────────────────────────
+      - name: Capture language toolchains
+        run: |
+          mkdir -p backup/toolchains
+
+          # Java JDKs (/usr/lib/jvm)
+          if [ -d /usr/lib/jvm ]; then
+            sudo rsync -a --ignore-errors /usr/lib/jvm/ backup/toolchains/jvm/ 2>/dev/null || true
+            echo "JVM: $(du -sh backup/toolchains/jvm/ | cut -f1)"
+          fi
+
+          # Rust / cargo
+          if [ -d "$HOME/.cargo" ]; then
+            rsync -a --ignore-errors "$HOME/.cargo/"  backup/toolchains/cargo/  2>/dev/null || true
+            echo "Cargo: $(du -sh backup/toolchains/cargo/ | cut -f1)"
+          fi
+          if [ -d "$HOME/.rustup" ]; then
+            rsync -a --ignore-errors "$HOME/.rustup/" backup/toolchains/rustup/ 2>/dev/null || true
+            echo "Rustup: $(du -sh backup/toolchains/rustup/ | cut -f1)"
+          fi
+
+          # nvm (Node version manager)
+          if [ -d "$HOME/.nvm" ]; then
+            rsync -a --ignore-errors "$HOME/.nvm/"    backup/toolchains/nvm/    2>/dev/null || true
+            echo "NVM: $(du -sh backup/toolchains/nvm/ | cut -f1)"
+          fi
+
+          # Volta (Node toolchain manager)
+          if [ -d "$HOME/.volta" ]; then
+            rsync -a --ignore-errors "$HOME/.volta/"  backup/toolchains/volta/  2>/dev/null || true
+            echo "Volta: $(du -sh backup/toolchains/volta/ | cut -f1)"
+          fi
+
+          # Ruby managers
+          [ -d "$HOME/.rbenv" ] && rsync -a --ignore-errors "$HOME/.rbenv/" backup/toolchains/rbenv/ 2>/dev/null || true
+          [ -d "$HOME/.rvm"   ] && rsync -a --ignore-errors "$HOME/.rvm/"   backup/toolchains/rvm/   2>/dev/null || true
+
+          # pyenv
+          [ -d "$HOME/.pyenv" ] && rsync -a --ignore-errors "$HOME/.pyenv/" backup/toolchains/pyenv/ 2>/dev/null || true
+
+          echo "Total toolchains: $(du -sh backup/toolchains/ | cut -f1)"
+
+      # ── 11. Full home dotfiles and ~/.config ───────────────────────────────
+      - name: Capture home dotfiles (actual file contents)
+        run: |
+          mkdir -p backup/home/dotfiles
+          mkdir -p backup/home/config
+          mkdir -p backup/home/local-share
+
+          # All dotfiles in ~/ (skip history/cache)
+          find ~ -maxdepth 1 -name '.*' -type f \
+            ! -name '.bash_history' \
+            ! -name '.lesshst' \
+            ! -name '.viminfo' \
+            | while read f; do
+                cp "$f" "backup/home/dotfiles/$(basename "$f")" 2>/dev/null || true
+              done
+
+          # Full ~/.config (editors, linters, formatters, tool configs)
+          if [ -d ~/.config ]; then
+            rsync -a --ignore-errors \
+              --exclude='google-chrome/' \
+              --exclude='chromium/' \
+              --exclude='BraveSoftware/' \
+              --exclude='Code/Cache/' \
+              --exclude='Code/CachedData/' \
+              --exclude='*/Cache/' \
+              --exclude='*/CacheStorage/' \
+              ~/.config/ backup/home/config/ 2>/dev/null || true
+          fi
+
+          # ~/.local/share (app data: nvim plugins, vim, etc.)
+          if [ -d ~/.local/share ]; then
+            rsync -a --ignore-errors \
+              --exclude='Trash/' \
+              --exclude='*/Cache/' \
+              ~/.local/share/ backup/home/local-share/ 2>/dev/null || true
+          fi
+
+          echo "Dotfiles captured: $(ls backup/home/dotfiles/ | wc -l) files"
+          echo "~/.config size:    $(du -sh backup/home/config/     | cut -f1)"
+          echo "~/.local/share:    $(du -sh backup/home/local-share/ | cut -f1)"
+
+          # Full file tree for reference
+          find ~ -maxdepth 5 -not -path '*/\.git/*' > backup/home/file-tree.txt
+
+      - name: Capture git global config
+        run: |
+          git config --global --list 2>/dev/null > backup/home/gitconfig.txt || true
+          [ -f ~/.gitignore_global ] && cp ~/.gitignore_global backup/home/ || true
+
+      - name: Capture SSH config (public keys only, NO private keys)
+        run: |
+          mkdir -p backup/ssh
+          [ -f ~/.ssh/config ]      && cp ~/.ssh/config      backup/ssh/ || true
+          [ -f ~/.ssh/known_hosts ] && cp ~/.ssh/known_hosts backup/ssh/ || true
+          for pub in ~/.ssh/*.pub; do
+            [ -f "$pub" ] && cp "$pub" backup/ssh/ || true
+          done
+
+      # ── 12. Size summary ──────────────────────────────────────────────────
+      - name: Print backup size breakdown
+        run: |
+          echo "===== Backup size breakdown ====="
+          du -sh backup/*/  | sort -rh
+          echo "================================="
+          du -sh backup/
+
+      # ── 13. Generate restore.sh ───────────────────────────────────────────
+      - name: Generate restore.sh
+        run: |
+          cat > backup/restore.sh << 'RESTORE_SCRIPT'
+          #!/usr/bin/env bash
+          # =============================================================================
+          # restore.sh — Restore a GitHub Actions Ubuntu runner backup to a local machine
+          # Run as: sudo bash restore.sh
+          # Target OS should match the backup source (e.g. Ubuntu 24.04)
+          # =============================================================================
+          set -euo pipefail
+          SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          BACKUP_DIR="$SCRIPT_DIR"
+          TARGET_USER="${SUDO_USER:-$USER}"
+          TARGET_HOME=$(eval echo "~$TARGET_USER")
+
+          echo "==> [1/10] Restoring apt sources..."
+          if [ -d "$BACKUP_DIR/etc/apt" ]; then
+            cp "$BACKUP_DIR/etc/apt/sources.list" /etc/apt/sources.list 2>/dev/null || true
+            cp -r "$BACKUP_DIR/etc/apt/sources.list.d/." /etc/apt/sources.list.d/ 2>/dev/null || true
+          fi
+          apt-get update -qq
+
+          echo "==> [2/10] Restoring apt packages..."
+          if [ -f "$BACKUP_DIR/packages/dpkg-selections.txt" ]; then
+            dpkg --set-selections < "$BACKUP_DIR/packages/dpkg-selections.txt"
+            apt-get -y dselect-upgrade
+          fi
+
+          echo "==> [3/10] Restoring /etc config (skipping network/hostname)..."
+          rsync -a --ignore-errors \
+            --exclude='hostname' \
+            --exclude='hosts' \
+            --exclude='resolv.conf' \
+            --exclude='netplan/' \
+            --exclude='network/' \
+            --exclude='NetworkManager/' \
+            --exclude='apt/' \
+            "$BACKUP_DIR/etc/" /etc/ 2>/dev/null || true
+
+          echo "==> [4/10] Restoring /usr/local..."
+          if [ -d "$BACKUP_DIR/usr-local" ]; then
+            rsync -a --ignore-errors "$BACKUP_DIR/usr-local/" /usr/local/ 2>/dev/null || true
+            ldconfig
+          fi
+
+          echo "==> [5/10] Restoring /opt..."
+          if [ -d "$BACKUP_DIR/opt" ]; then
+            rsync -a --ignore-errors "$BACKUP_DIR/opt/" /opt/ 2>/dev/null || true
+          fi
+
+          echo "==> [6/10] Restoring language toolchains..."
+          if [ -d "$BACKUP_DIR/toolchains/jvm" ]; then
+            rsync -a --ignore-errors "$BACKUP_DIR/toolchains/jvm/" /usr/lib/jvm/ || true
+          fi
+          for tc in cargo rustup nvm volta rbenv rvm pyenv; do
+            if [ -d "$BACKUP_DIR/toolchains/$tc" ]; then
+              echo "    Restoring $tc → $TARGET_HOME/.$tc"
+              rsync -a --ignore-errors "$BACKUP_DIR/toolchains/$tc/" "$TARGET_HOME/.$tc/" || true
+              chown -R "$TARGET_USER:$TARGET_USER" "$TARGET_HOME/.$tc"
+            fi
+          done
+
+          echo "==> [7/10] Restoring pip packages..."
+          for pip_file in "$BACKUP_DIR"/packages/pip-*.txt; do
+            [ -f "$pip_file" ] || continue
+            py=$(basename "$pip_file" .txt | sed 's/pip-//')
+            command -v "$py" &>/dev/null && $py -m pip install -r "$pip_file" --quiet 2>/dev/null || true
+          done
+
+          echo "==> [8/10] Restoring npm global packages..."
+          if [ -f "$BACKUP_DIR/packages/npm-global.txt" ] && command -v npm &>/dev/null; then
+            grep -v '^/' "$BACKUP_DIR/packages/npm-global.txt" | grep '@' | \
+              awk '{print $2}' | xargs npm install -g --quiet 2>/dev/null || true
+          fi
+
+          echo "==> [9/10] Restoring home dotfiles, ~/.config, ~/.local/share..."
+          if [ -d "$BACKUP_DIR/home/dotfiles" ]; then
+            for f in "$BACKUP_DIR/home/dotfiles/".*; do
+              [ -f "$f" ] || continue
+              fname=$(basename "$f")
+              [ -f "$TARGET_HOME/$fname" ] && cp "$TARGET_HOME/$fname" "$TARGET_HOME/${fname}.bak"
+              cp "$f" "$TARGET_HOME/$fname"
+              chown "$TARGET_USER:$TARGET_USER" "$TARGET_HOME/$fname"
+            done
+          fi
+          if [ -d "$BACKUP_DIR/home/config" ]; then
+            mkdir -p "$TARGET_HOME/.config"
+            rsync -a --ignore-errors "$BACKUP_DIR/home/config/" "$TARGET_HOME/.config/" || true
+            chown -R "$TARGET_USER:$TARGET_USER" "$TARGET_HOME/.config"
+          fi
+          if [ -d "$BACKUP_DIR/home/local-share" ]; then
+            mkdir -p "$TARGET_HOME/.local/share"
+            rsync -a --ignore-errors "$BACKUP_DIR/home/local-share/" "$TARGET_HOME/.local/share/" || true
+            chown -R "$TARGET_USER:$TARGET_USER" "$TARGET_HOME/.local"
+          fi
+
+          echo "==> [10/10] Restoring SSH config and known_hosts..."
+          if [ -d "$BACKUP_DIR/ssh" ]; then
+            mkdir -p "$TARGET_HOME/.ssh"
+            [ -f "$BACKUP_DIR/ssh/config" ]      && cp "$BACKUP_DIR/ssh/config"      "$TARGET_HOME/.ssh/"
+            [ -f "$BACKUP_DIR/ssh/known_hosts" ] && cp "$BACKUP_DIR/ssh/known_hosts" "$TARGET_HOME/.ssh/"
+            for pub in "$BACKUP_DIR/ssh/"*.pub; do
+              [ -f "$pub" ] && cp "$pub" "$TARGET_HOME/.ssh/" || true
+            done
+            chown -R "$TARGET_USER:$TARGET_USER" "$TARGET_HOME/.ssh"
+            chmod 700 "$TARGET_HOME/.ssh"
+            chmod 600 "$TARGET_HOME/.ssh/"* 2>/dev/null || true
+          fi
+
+          echo ""
+          echo "✅ Restore complete!"
+          echo ""
+          echo "Follow-up steps:"
+          echo "  1. Review backup/env/environment.txt — re-export needed vars in ~/.bashrc"
+          echo "  2. Re-enable systemd services listed in backup/services/services-enabled.txt"
+          echo "  3. Add SSH private keys manually (not backed up by design)"
+          echo "  4. Re-enter git credentials / tokens as needed"
+          echo "  5. Run: source ~/.bashrc  (or log out and back in)"
+          RESTORE_SCRIPT
+          chmod +x backup/restore.sh
+
+      # ── 14. README ─────────────────────────────────────────────────────────
+      - name: Generate summary README
+        run: |
+          cat > backup/README.md << EOF
+          # Ubuntu Runner Backup
+          **Created:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          **Runner OS:** $(lsb_release -ds 2>/dev/null || uname -r)
+          **Kernel:** $(uname -r)
+
+          ## Contents
+          | Folder | What's inside |
+          |--------|--------------|
+          | packages/ | apt, pip, npm, snap, gem package lists |
+          | etc/ | Full /etc (all system config files) |
+          | system/ | OS info, sysctl, disk layout, fstab |
+          | env/ | Environment variables, PATH, tool versions |
+          | services/ | systemd service state + custom unit files |
+          | users/ | /etc/passwd and /etc/group |
+          | network/ | IP addresses, routes, open ports |
+          | usr-local/ | Full /usr/local (custom binaries & libs) |
+          | opt/ | Full /opt (third-party SDKs & tools) |
+          | toolchains/ | JVM, Rust/cargo, nvm, volta, rbenv, pyenv |
+          | home/dotfiles/ | All ~/. dotfiles (actual file contents) |
+          | home/config/ | Full ~/.config directory |
+          | home/local-share/ | Full ~/.local/share directory |
+          | cron/ | User + system cron jobs |
+          | ssh/ | SSH config + public keys (NO private keys) |
+          | restore.sh | Automated restore script |
+
+          ## How to Restore
+          \`\`\`bash
+          tar -xzf ubuntu-runner-backup-*.tar.gz
+          cd backup/
+          sudo bash restore.sh
+          \`\`\`
+
+          ## ⚠️ Notes
+          - No private SSH keys (never store in CI artifacts)
+          - No secrets/tokens — review env/environment.txt before applying
+          - /etc restore skips hostname, hosts, resolv.conf, netplan (machine-specific)
+          - Best results when restoring onto a matching Ubuntu version (see Runner OS above)
+          EOF
+
+      # ── 15. Compress ───────────────────────────────────────────────────────
+      - name: Compress backup
+        run: |
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H-%M-%SZ")
+          tar -czf "ubuntu-runner-backup-${TIMESTAMP}.tar.gz" backup/
+          echo "Final archive: $(du -sh ubuntu-runner-backup-${TIMESTAMP}.tar.gz | cut -f1)"
+          echo "BACKUP_FILE=ubuntu-runner-backup-${TIMESTAMP}.tar.gz" >> $GITHUB_ENV
+
+      # ── 16. Upload to Google Drive ─────────────────────────────────────────
+      - name: Install rclone
+        run: curl https://rclone.org/install.sh | sudo bash
+
+      - name: Configure rclone for Google Drive
+        env:
+          GDRIVE_CLIENT_ID:      ${{ secrets.GDRIVE_CLIENT_ID }}
+          GDRIVE_CLIENT_SECRET:  ${{ secrets.GDRIVE_CLIENT_SECRET }}
+          GDRIVE_TOKEN:          ${{ secrets.GDRIVE_TOKEN }}
+          GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GDRIVE_ROOT_FOLDER_ID }}
+        run: |
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf << EOF
+          [gdrive]
+          type = drive
+          client_id = ${GDRIVE_CLIENT_ID}
+          client_secret = ${GDRIVE_CLIENT_SECRET}
+          token = ${GDRIVE_TOKEN}
+          root_folder_id = ${GDRIVE_ROOT_FOLDER_ID}
+          EOF
+
+      - name: Upload backup to Google Drive
+        run: |
+          rclone copy "${{ env.BACKUP_FILE }}" gdrive:github-backups \
+            --drive-chunk-size 128M \
+            --progress \
+            --stats-one-line
+          echo "✅ Uploaded ${{ env.BACKUP_FILE }} to Google Drive → github-backups/"
+
+      - name: Clean up rclone config
+        if: always()
+        run: rm -f ~/.config/rclone/rclone.conf
