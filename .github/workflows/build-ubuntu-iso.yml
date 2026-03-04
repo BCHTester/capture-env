@@ -1,0 +1,374 @@
+name: Build Bootable Ubuntu ISO
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 2 * * 0'  # Weekly on Sundays at 2am UTC
+
+jobs:
+  build-iso:
+    runs-on: ubuntu-24.04   # Pin this — your ISO will match this exact Ubuntu version
+    timeout-minutes: 340    # ~5h40m — leaves buffer under the 6h Actions limit
+
+    steps:
+      # ── 0. Assess available disk space ────────────────────────────────────
+      # We do NOT delete anything. Instead we stage directly into the live-build
+      # tree (single copy, no intermediate /tmp duplication) and use /mnt for
+      # the live-build working directory, which is on a separate larger volume.
+      - name: Show disk layout
+        run: |
+          echo "=== All mounts ==="
+          df -h
+          echo ""
+          echo "=== Largest directories on / ==="
+          sudo du -sh /usr/* /opt/* /home/* 2>/dev/null | sort -rh | head -30
+
+      # ── 1. Install live-build and dependencies ─────────────────────────────
+      - name: Install live-build and tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            live-build \
+            debootstrap \
+            squashfs-tools \
+            xorriso \
+            grub-pc-bin \
+            grub-efi-amd64-bin \
+            mtools \
+            rsync \
+            genisoimage
+
+      # ── 2. Initialise live-build on /mnt (larger separate volume) ─────────
+      - name: Initialise live-build config
+        run: |
+          # /mnt is typically a separate disk on GitHub-hosted runners with more
+          # free space than /. Using it avoids running out of room during the build.
+          sudo mkdir -p /mnt/live-build
+          sudo chown "$USER:$USER" /mnt/live-build
+          cd /mnt/live-build
+
+          lb config \
+            --mode debian \
+            --system live \
+            --distribution noble \
+            --archive-areas "main restricted universe multiverse" \
+            --apt-recommends false \
+            --binary-images iso-hybrid \
+            --bootloaders "grub-efi,syslinux" \
+            --debian-installer live \
+            --debian-installer-gui true \
+            --memtest none \
+            --linux-flavours generic \
+            --bootappend-live "boot=live components locales=en_US.UTF-8 keyboard-layouts=us username=runner hostname=ubuntu-runner" \
+            --iso-volume "Ubuntu-Runner-Backup" \
+            --compression xz
+
+      # ── 3. Capture package list ────────────────────────────────────────────
+      - name: Capture installed package list
+        run: |
+          mkdir -p /mnt/live-build/config/package-lists
+          # Full list of installed packages
+          dpkg --get-selections | awk '$2=="install"{print $1}' | sort \
+            > /mnt/live-build/config/package-lists/runner-packages.list.chroot
+
+          # Append live system essentials that must be present for a bootable ISO
+          cat >> /mnt/live-build/config/package-lists/runner-packages.list.chroot << 'EOF'
+          live-boot
+          live-config
+          live-config-systemd
+          ubiquity
+          ubiquity-frontend-gtk
+          network-manager
+          sudo
+          openssh-client
+          curl
+          wget
+          rsync
+          EOF
+
+          echo "Package list: $(wc -l < /mnt/live-build/config/package-lists/runner-packages.list.chroot) entries"
+
+      # ── 4. Inject apt sources and GPG keys ────────────────────────────────
+      - name: Inject apt sources and GPG keys
+        run: |
+          mkdir -p /mnt/live-build/config/archives
+
+          # Third-party .list sources
+          for f in /etc/apt/sources.list.d/*.list; do
+            [ -f "$f" ] && cp "$f" /mnt/live-build/config/archives/ || true
+          done
+          # DEB822 .sources format
+          for f in /etc/apt/sources.list.d/*.sources; do
+            [ -f "$f" ] && cp "$f" /mnt/live-build/config/archives/ || true
+          done
+          # GPG keys
+          for f in /etc/apt/trusted.gpg.d/*.gpg /etc/apt/trusted.gpg.d/*.asc; do
+            [ -f "$f" ] && cp "$f" /mnt/live-build/config/archives/ || true
+          done
+
+      # ── 5. Stage /etc directly into includes.chroot ───────────────────────
+      - name: Stage /etc into ISO rootfs
+        run: |
+          INCLUDES=/mnt/live-build/config/includes.chroot
+          mkdir -p "$INCLUDES/etc"
+
+          # Copy full /etc, skipping only credentials and machine-specific
+          # network config that would break a different machine
+          sudo rsync -a --ignore-errors \
+            --exclude='shadow' \
+            --exclude='shadow-' \
+            --exclude='gshadow' \
+            --exclude='gshadow-' \
+            --exclude='ssl/private/' \
+            --exclude='hostname' \
+            --exclude='hosts' \
+            --exclude='resolv.conf' \
+            --exclude='netplan/' \
+            --exclude='network/' \
+            --exclude='NetworkManager/' \
+            --exclude='apt/' \
+            /etc/ "$INCLUDES/etc/" 2>/dev/null || true
+
+          echo "/etc staged: $(find $INCLUDES/etc -type f | wc -l) files"
+
+      # ── 6. Stage /usr/local directly into includes.chroot ─────────────────
+      - name: Stage /usr/local into ISO rootfs
+        run: |
+          INCLUDES=/mnt/live-build/config/includes.chroot
+          mkdir -p "$INCLUDES/usr/local"
+
+          sudo rsync -a --ignore-errors \
+            --exclude='*.pyc' \
+            --exclude='__pycache__/' \
+            /usr/local/ "$INCLUDES/usr/local/" 2>/dev/null || true
+
+          echo "/usr/local staged: $(du -sh $INCLUDES/usr/local/ | cut -f1)"
+
+      # ── 7. Stage /opt directly into includes.chroot ───────────────────────
+      - name: Stage /opt into ISO rootfs
+        run: |
+          INCLUDES=/mnt/live-build/config/includes.chroot
+          mkdir -p "$INCLUDES/opt"
+
+          sudo rsync -a --ignore-errors \
+            --exclude='*.pyc' \
+            --exclude='__pycache__/' \
+            /opt/ "$INCLUDES/opt/" 2>/dev/null || true
+
+          echo "/opt staged: $(du -sh $INCLUDES/opt/ | cut -f1)"
+
+      # ── 8. Stage language toolchains ──────────────────────────────────────
+      - name: Stage language toolchains into ISO rootfs
+        run: |
+          INCLUDES=/mnt/live-build/config/includes.chroot
+
+          # JVM — goes directly to its system path
+          if [ -d /usr/lib/jvm ]; then
+            mkdir -p "$INCLUDES/usr/lib/jvm"
+            sudo rsync -a --ignore-errors /usr/lib/jvm/ "$INCLUDES/usr/lib/jvm/" 2>/dev/null || true
+            echo "JVM: $(du -sh $INCLUDES/usr/lib/jvm/ | cut -f1)"
+          fi
+
+          # User-level toolchains go into /etc/skel so they're applied to
+          # every user created during install
+          SKEL="$INCLUDES/etc/skel"
+          mkdir -p "$SKEL"
+
+          for pair in \
+            "$HOME/.cargo:.cargo" \
+            "$HOME/.rustup:.rustup" \
+            "$HOME/.nvm:.nvm" \
+            "$HOME/.volta:.volta" \
+            "$HOME/.pyenv:.pyenv" \
+            "$HOME/.rbenv:.rbenv" \
+            "$HOME/.rvm:.rvm"; do
+            src="${pair%%:*}"
+            dst="${pair##*:}"
+            if [ -d "$src" ]; then
+              rsync -a --ignore-errors "$src/" "$SKEL/$dst/" 2>/dev/null || true
+              echo "$dst: $(du -sh $SKEL/$dst/ | cut -f1)"
+            fi
+          done
+
+      # ── 9. Stage home dotfiles and ~/.config into /etc/skel ───────────────
+      - name: Stage home dotfiles into /etc/skel
+        run: |
+          SKEL=/mnt/live-build/config/includes.chroot/etc/skel
+
+          # All dotfiles in ~/
+          find ~ -maxdepth 1 -name '.*' -type f \
+            ! -name '.bash_history' \
+            ! -name '.lesshst' \
+            ! -name '.viminfo' \
+            | while read f; do
+                cp "$f" "$SKEL/$(basename "$f")" 2>/dev/null || true
+              done
+
+          # Full ~/.config
+          if [ -d ~/.config ]; then
+            rsync -a --ignore-errors \
+              --exclude='*/Cache/' \
+              --exclude='*/CacheStorage/' \
+              --exclude='google-chrome/' \
+              --exclude='chromium/' \
+              ~/.config/ "$SKEL/.config/" 2>/dev/null || true
+          fi
+
+          # ~/.local/share
+          if [ -d ~/.local/share ]; then
+            rsync -a --ignore-errors \
+              --exclude='Trash/' \
+              --exclude='*/Cache/' \
+              ~/.local/share/ "$SKEL/.local/share/" 2>/dev/null || true
+          fi
+
+          echo "skel dotfiles: $(ls -A $SKEL | wc -l) entries"
+          echo "skel total:    $(du -sh $SKEL | cut -f1)"
+
+      # ── 10. Create ldconfig hook (needed after /usr/local is placed) ───────
+      - name: Create chroot hook for ldconfig and PATH fixups
+        run: |
+          mkdir -p /mnt/live-build/config/hooks/live
+
+          cat > /mnt/live-build/config/hooks/live/0100-fixup.hook.chroot << 'HOOK'
+          #!/bin/bash
+          set -e
+
+          # Rebuild the dynamic linker cache after /usr/local libs were placed
+          ldconfig
+
+          # Ensure /usr/local/bin is in the system-wide PATH
+          echo 'PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"' \
+            > /etc/environment
+
+          # Make sure the runner user exists and owns their home toolchains
+          if id runner &>/dev/null; then
+            chown -R runner:runner /home/runner 2>/dev/null || true
+          fi
+
+          # If cargo/rustup/nvm etc. are in skel, add their init lines to
+          # /etc/skel/.bashrc so they activate on login
+          SKEL_BASHRC=/etc/skel/.bashrc
+
+          # Rust
+          if [ -d /etc/skel/.cargo ]; then
+            grep -q 'cargo/env' "$SKEL_BASHRC" 2>/dev/null || \
+              echo '. "$HOME/.cargo/env"' >> "$SKEL_BASHRC"
+          fi
+
+          # nvm
+          if [ -d /etc/skel/.nvm ]; then
+            grep -q 'NVM_DIR' "$SKEL_BASHRC" 2>/dev/null || cat >> "$SKEL_BASHRC" << 'NVM'
+          export NVM_DIR="$HOME/.nvm"
+          [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+          [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"
+          NVM
+          fi
+
+          # pyenv
+          if [ -d /etc/skel/.pyenv ]; then
+            grep -q 'pyenv' "$SKEL_BASHRC" 2>/dev/null || cat >> "$SKEL_BASHRC" << 'PYENV'
+          export PYENV_ROOT="$HOME/.pyenv"
+          command -v pyenv >/dev/null || export PATH="$PYENV_ROOT/bin:$PATH"
+          eval "$(pyenv init -)"
+          PYENV
+          fi
+
+          # rbenv
+          if [ -d /etc/skel/.rbenv ]; then
+            grep -q 'rbenv' "$SKEL_BASHRC" 2>/dev/null || \
+              echo 'eval "$(~/.rbenv/bin/rbenv init - bash)"' >> "$SKEL_BASHRC"
+          fi
+          HOOK
+
+          chmod +x /mnt/live-build/config/hooks/live/0100-fixup.hook.chroot
+
+      # ── 11. Show disk state before the expensive build step ───────────────
+      - name: Show disk state before build
+        run: |
+          echo "=== Disk layout ==="
+          df -h
+          echo ""
+          echo "=== live-build includes size ==="
+          du -sh /mnt/live-build/config/includes.chroot/*/  2>/dev/null | sort -rh
+          echo ""
+          echo "=== Total live-build tree ==="
+          du -sh /mnt/live-build/
+
+      # ── 12. Build the ISO ──────────────────────────────────────────────────
+      - name: Build ISO
+        working-directory: /mnt/live-build
+        run: |
+          echo "Starting live-build — typically takes 30–90 minutes..."
+          sudo lb build 2>&1 | tee /tmp/live-build.log
+          echo ""
+          echo "=== ISO output ==="
+          ls -lh /mnt/live-build/*.iso /mnt/live-build/live-image*.hybrid.iso 2>/dev/null
+
+      - name: Name ISO with timestamp and verify
+        run: |
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H-%M-%SZ")
+          OS_VERSION=$(lsb_release -rs 2>/dev/null || echo "24.04")
+          ISO_NAME="ubuntu-runner-${OS_VERSION}-${TIMESTAMP}.iso"
+
+          ISO_SRC=$(ls /mnt/live-build/*.iso /mnt/live-build/live-image*.hybrid.iso 2>/dev/null | head -1)
+          if [ -z "$ISO_SRC" ]; then
+            echo "ERROR: No ISO file found — build may have failed. Check the build log artifact."
+            exit 1
+          fi
+
+          mv "$ISO_SRC" "/mnt/${ISO_NAME}"
+          ISO_SIZE=$(du -sh "/mnt/${ISO_NAME}" | cut -f1)
+          echo "ISO: ${ISO_NAME}  (${ISO_SIZE})"
+
+          # Generate SHA256 checksum alongside the ISO
+          sha256sum "/mnt/${ISO_NAME}" > "/mnt/${ISO_NAME}.sha256"
+
+          echo "ISO_FILE=/mnt/${ISO_NAME}"       >> $GITHUB_ENV
+          echo "ISO_SHA=/mnt/${ISO_NAME}.sha256"  >> $GITHUB_ENV
+          echo "ISO_NAME=${ISO_NAME}"             >> $GITHUB_ENV
+
+      # ── 13. Upload ISO + checksum to Google Drive ─────────────────────────
+      - name: Install rclone
+        run: curl https://rclone.org/install.sh | sudo bash
+
+      - name: Configure rclone for Google Drive
+        env:
+          GDRIVE_CLIENT_ID:      ${{ secrets.GDRIVE_CLIENT_ID }}
+          GDRIVE_CLIENT_SECRET:  ${{ secrets.GDRIVE_CLIENT_SECRET }}
+          GDRIVE_TOKEN:          ${{ secrets.GDRIVE_TOKEN }}
+          GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GDRIVE_ROOT_FOLDER_ID }}
+        run: |
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf << EOF
+          [gdrive]
+          type = drive
+          client_id = ${GDRIVE_CLIENT_ID}
+          client_secret = ${GDRIVE_CLIENT_SECRET}
+          token = ${GDRIVE_TOKEN}
+          root_folder_id = ${GDRIVE_ROOT_FOLDER_ID}
+          EOF
+
+      - name: Upload ISO and checksum to Google Drive
+        run: |
+          echo "Uploading ${{ env.ISO_NAME }}..."
+          rclone copy "${{ env.ISO_FILE }}" gdrive:github-iso-builds \
+            --drive-chunk-size 256M \
+            --transfers 1 \
+            --progress \
+            --stats 30s
+          rclone copy "${{ env.ISO_SHA }}" gdrive:github-iso-builds
+          echo "✅ Uploaded to Google Drive → github-iso-builds/${{ env.ISO_NAME }}"
+
+      - name: Clean up rclone config
+        if: always()
+        run: rm -f ~/.config/rclone/rclone.conf
+
+      # ── 14. Upload build log as artifact ──────────────────────────────────
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-build-log-${{ github.run_id }}
+          path: /tmp/live-build.log
+          retention-days: 7
