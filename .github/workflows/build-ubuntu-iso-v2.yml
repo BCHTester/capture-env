@@ -2,8 +2,8 @@ name: Build Bootable Ubuntu ISO
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '0 2 * * 0'  # Weekly on Sundays at 2am UTC
+  #schedule:
+    #- cron: '0 2 * * 0'  # Weekly on Sundays at 2am UTC
 
 jobs:
   build-iso:
@@ -17,6 +17,7 @@ jobs:
       # the live-build working directory, which is on a separate larger volume.
       - name: Show disk layout
         run: |
+          sudo su
           echo "=== All mounts ==="
           df -h
           echo ""
@@ -26,6 +27,7 @@ jobs:
       # ── 1. Install live-build and dependencies ─────────────────────────────
       - name: Install live-build and tools
         run: |
+          sudo su
           sudo apt-get update -qq
           sudo apt-get install -y \
             live-build \
@@ -41,6 +43,7 @@ jobs:
       # ── 2. Initialise live-build ───────────────────────────────────────────
       - name: Initialise live-build config
         run: |
+          sudo su
           # The runner has a single 145GB root partition with ~92GB free.
           # We build in ~/live-build under the runner home directory.
           mkdir -p ~/live-build
@@ -68,6 +71,7 @@ jobs:
       # ── 3. Capture package list ────────────────────────────────────────────
       - name: Capture installed package list
         run: |
+          sudo su
           mkdir -p ~/live-build/config/package-lists
           # Full list of installed packages
           dpkg --get-selections | awk '$2=="install"{print $1}' | sort \
@@ -93,6 +97,7 @@ jobs:
       # ── 4. Inject apt sources and GPG keys ────────────────────────────────
       - name: Inject apt sources and GPG keys
         run: |
+          sudo su
           mkdir -p ~/live-build/config/archives
 
           # Third-party .list sources
@@ -111,6 +116,7 @@ jobs:
       # ── 5. Stage /etc directly into includes.chroot ───────────────────────
       - name: Stage /etc into ISO rootfs
         run: |
+          sudo su
           INCLUDES=~/live-build/config/includes.chroot
           mkdir -p "$INCLUDES/etc"
 
@@ -136,6 +142,7 @@ jobs:
       # ── 6. Stage /usr/local directly into includes.chroot ─────────────────
       - name: Stage /usr/local into ISO rootfs
         run: |
+          sudo su
           INCLUDES=~/live-build/config/includes.chroot
           mkdir -p "$INCLUDES/usr/local"
 
@@ -149,6 +156,7 @@ jobs:
       # ── 7. Stage /opt directly into includes.chroot ───────────────────────
       - name: Stage /opt into ISO rootfs
         run: |
+          sudo su
           INCLUDES=~/live-build/config/includes.chroot
           mkdir -p "$INCLUDES/opt"
 
@@ -162,6 +170,7 @@ jobs:
       # ── 8. Stage language toolchains ──────────────────────────────────────
       - name: Stage language toolchains into ISO rootfs
         run: |
+          sudo su
           INCLUDES=~/live-build/config/includes.chroot
 
           # JVM — goes directly to its system path
@@ -195,6 +204,7 @@ jobs:
       # ── 9. Stage home dotfiles and ~/.config into /etc/skel ───────────────
       - name: Stage home dotfiles into /etc/skel
         run: |
+          sudo su
           SKEL=~/live-build/config/includes.chroot/etc/skel
 
           # All dotfiles in ~/
@@ -230,6 +240,7 @@ jobs:
       # ── 10. Create ldconfig hook (needed after /usr/local is placed) ───────
       - name: Create chroot hook for ldconfig and PATH fixups
         run: |
+          sudo su
           mkdir -p ~/live-build/config/hooks/live
 
           cat > ~/live-build/config/hooks/live/0100-fixup.hook.chroot << 'HOOK'
@@ -288,6 +299,7 @@ jobs:
       # ── 11. Show disk state before the expensive build step ───────────────
       - name: Show disk state before build
         run: |
+          sudo su
           echo "=== Disk layout ==="
           df -h
           echo ""
@@ -301,6 +313,7 @@ jobs:
       - name: Build ISO
         working-directory: /home/runner/live-build
         run: |
+          sudo su
           echo "Starting live-build — typically takes 30–90 minutes..."
           sudo lb build 2>&1 | tee /tmp/live-build.log
           echo ""
@@ -309,6 +322,7 @@ jobs:
 
       - name: Name ISO with timestamp and verify
         run: |
+          sudo su
           TIMESTAMP=$(date -u +"%Y-%m-%dT%H-%M-%SZ")
           OS_VERSION=$(lsb_release -rs 2>/dev/null || echo "24.04")
           ISO_NAME="ubuntu-runner-${OS_VERSION}-${TIMESTAMP}.iso"
@@ -332,7 +346,7 @@ jobs:
 
       # ── 13. Upload ISO + checksum to Google Drive ─────────────────────────
       - name: Install rclone
-        run: curl https://rclone.org/install.sh | sudo bash
+        run: sudo curl https://rclone.org/install.sh | sudo bash
 
       - name: Configure rclone for Google Drive
         env:
@@ -341,6 +355,7 @@ jobs:
           GDRIVE_TOKEN:          ${{ secrets.GDRIVE_TOKEN }}
           GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GDRIVE_ROOT_FOLDER_ID }}
         run: |
+          sudo su
           mkdir -p ~/.config/rclone
           cat > ~/.config/rclone/rclone.conf << EOF
           [gdrive]
@@ -353,6 +368,7 @@ jobs:
 
       - name: Upload ISO and checksum to Google Drive
         run: |
+          sudo su
           echo "Uploading ${{ env.ISO_NAME }}..."
           rclone copy "${{ env.ISO_FILE }}" gdrive:github-iso-builds \
             --drive-chunk-size 256M \
@@ -364,7 +380,7 @@ jobs:
 
       - name: Clean up rclone config
         if: always()
-        run: rm -f ~/.config/rclone/rclone.conf
+        run: sudo rm -f ~/.config/rclone/rclone.conf
 
       # ── 14. Upload build log as artifact ──────────────────────────────────
       - name: Upload build log
