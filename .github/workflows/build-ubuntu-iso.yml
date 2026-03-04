@@ -47,12 +47,18 @@ jobs:
       # ── 2b. Disable syslinux (obsolete theme packages removed from Noble) ──
       - name: Disable syslinux bootloader
         run: |
-          # syslinux-themes-ubuntu-oneiric and gfxboot-theme-ubuntu no longer
-          # exist in Ubuntu Noble. Disable syslinux entirely; grub handles both
-          # BIOS and UEFI boot on an iso-hybrid image.
-          sed -i 's/^LB_SYSLINUX=.*/LB_SYSLINUX="false"/' ~/live-build/config/binary
-          grep LB_SYSLINUX ~/live-build/config/binary || echo 'LB_SYSLINUX="false"' >> ~/live-build/config/binary
-          echo "syslinux disabled"
+          # syslinux-themes-ubuntu-oneiric and gfxboot-theme-ubuntu were removed
+          # from Ubuntu Noble. Replace live-build's syslinux script with a no-op
+          # so it is skipped entirely. Grub handles both BIOS and UEFI boot.
+          SYSLINUX_SCRIPT=$(find /usr/lib/live/build/ -name 'binary_syslinux' 2>/dev/null | head -1)
+          if [ -n "$SYSLINUX_SCRIPT" ]; then
+            sudo cp "$SYSLINUX_SCRIPT" "${SYSLINUX_SCRIPT}.bak"
+            printf '#!/bin/sh\necho "P: Skipping syslinux (disabled)"\nexit 0\n'               | sudo tee "$SYSLINUX_SCRIPT" > /dev/null
+            sudo chmod +x "$SYSLINUX_SCRIPT"
+            echo "Patched: $SYSLINUX_SCRIPT"
+          else
+            echo "WARNING: binary_syslinux script not found — may still fail"
+          fi
 
       # ── 3. Inject package list ─────────────────────────────────────────────
       # Dump all installed packages and let live-build's apt resolve what is
