@@ -141,11 +141,8 @@ jobs:
           # so it's present in the chroot before apt runs at all.
           # This handles third-party repos (Microsoft etc.) with key issues.
           mkdir -p "$INCLUDES/etc/apt/apt.conf.d"
-          cat > "$INCLUDES/etc/apt/apt.conf.d/99-live-build-insecure" << 'APTCONF'
-APT::Get::AllowUnauthenticated "true";
-Acquire::AllowInsecureRepositories "true";
-Acquire::AllowDowngradeToInsecureRepositories "true";
-APTCONF
+          printf 'APT::Get::AllowUnauthenticated "true";\nAcquire::AllowInsecureRepositories "true";\nAcquire::AllowDowngradeToInsecureRepositories "true";\n' \
+            > "$INCLUDES/etc/apt/apt.conf.d/99-live-build-insecure"
 
           # Copy full /etc, skipping only credentials and machine-specific
           # network config that would break a different machine
