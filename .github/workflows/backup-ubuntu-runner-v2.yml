@@ -2,8 +2,8 @@ name: Backup Ubuntu Runner v2
 
 on:
   workflow_dispatch:  # Run manually whenever you want a backup
-  schedule:
-    - cron: '0 2 * * 0'  # Optional: auto-run weekly on Sundays at 2am UTC
+  #schedule:
+    #- cron: '0 2 * * 0'  # Optional: auto-run weekly on Sundays at 2am UTC
 
 jobs:
   backup:
