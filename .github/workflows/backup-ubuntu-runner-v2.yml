@@ -1,4 +1,4 @@
-name: Backup Ubuntu Runner Environment
+name: Backup Ubuntu Runner v2
 
 on:
   workflow_dispatch:  # Run manually whenever you want a backup
@@ -15,6 +15,7 @@ jobs:
       # ── 1. Installed packages ──────────────────────────────────────────────
       - name: Capture installed apt packages
         run: |
+          sudo su
           mkdir -p backup/packages
           dpkg --get-selections > backup/packages/dpkg-selections.txt
           apt-mark showmanual   > backup/packages/apt-manual.txt
@@ -22,10 +23,12 @@ jobs:
 
       - name: Capture snap packages
         run: |
+          sudo su
           snap list --all > backup/packages/snap-list.txt 2>/dev/null || echo "(no snaps)" > backup/packages/snap-list.txt
 
       - name: Capture pip packages (all Python versions)
         run: |
+          sudo su
           for py in python3 python3.10 python3.11 python3.12; do
             if command -v $py &>/dev/null; then
               $py -m pip freeze 2>/dev/null > backup/packages/pip-${py}.txt || true
@@ -34,15 +37,18 @@ jobs:
 
       - name: Capture npm global packages
         run: |
+          sudo su
           npm list -g --depth=0 2>/dev/null > backup/packages/npm-global.txt || echo "(npm not found)" > backup/packages/npm-global.txt
 
       - name: Capture gem packages (Ruby)
         run: |
+          sudo su
           gem list 2>/dev/null > backup/packages/gem-list.txt || echo "(gem not found)" > backup/packages/gem-list.txt
 
       # ── 2. System info ────────────────────────────────────────────────────
       - name: Capture system info
         run: |
+          sudo su
           mkdir -p backup/system
           uname -a                > backup/system/uname.txt
           lsb_release -a        >> backup/system/uname.txt 2>/dev/null
@@ -57,6 +63,7 @@ jobs:
 
       - name: Capture crontabs
         run: |
+          sudo su
           mkdir -p backup/cron
           crontab -l 2>/dev/null > backup/cron/user-crontab.txt || echo "(no user crontab)" > backup/cron/user-crontab.txt
           cp -r /etc/cron.d/      backup/cron/cron.d/      2>/dev/null || true
@@ -66,6 +73,7 @@ jobs:
       # ── 3. Full /etc ───────────────────────────────────────────────────────
       - name: Capture full /etc directory
         run: |
+          sudo su
           mkdir -p backup/etc
           sudo rsync -a --ignore-errors \
             --exclude='shadow' \
@@ -79,12 +87,14 @@ jobs:
       # ── 4. Environment & shell config ─────────────────────────────────────
       - name: Capture environment variables
         run: |
+          sudo su
           mkdir -p backup/env
           env | grep -v -iE '(token|secret|key|password|credential|auth)' | sort > backup/env/environment.txt
           echo "# WARNING: Review and remove sensitive values before restoring" >> backup/env/environment.txt
 
       - name: Capture PATH and tool versions
         run: |
+          sudo su
           echo "PATH=$PATH" > backup/env/path.txt
           {
             echo "=== Key tool versions ===";
@@ -102,6 +112,7 @@ jobs:
       # ── 5. Systemd services ────────────────────────────────────────────────
       - name: Capture systemd service state
         run: |
+          sudo su
           mkdir -p backup/services/custom-units
           systemctl list-units --type=service --all --no-pager          > backup/services/services-all.txt     2>/dev/null || true
           systemctl list-units --type=service --state=enabled --no-pager > backup/services/services-enabled.txt 2>/dev/null || true
@@ -110,6 +121,7 @@ jobs:
       # ── 6. Users and groups ────────────────────────────────────────────────
       - name: Capture users and groups
         run: |
+          sudo su
           mkdir -p backup/users
           cat /etc/passwd > backup/users/passwd.txt
           cat /etc/group  > backup/users/group.txt
@@ -117,6 +129,7 @@ jobs:
       # ── 7. Network configuration ───────────────────────────────────────────
       - name: Capture network config
         run: |
+          sudo su
           mkdir -p backup/network
           ip addr show             > backup/network/ip-addr.txt
           ip route show            > backup/network/ip-route.txt
@@ -126,6 +139,7 @@ jobs:
       # ── 8. /usr/local — custom-installed binaries & libraries ─────────────
       - name: Capture /usr/local
         run: |
+          sudo su
           mkdir -p backup/usr-local
           sudo rsync -a --ignore-errors \
             --exclude='*.pyc' \
@@ -136,6 +150,7 @@ jobs:
       # ── 9. /opt — third-party SDKs and tools ──────────────────────────────
       - name: Capture /opt
         run: |
+          sudo su
           mkdir -p backup/opt
           sudo rsync -a --ignore-errors \
             --exclude='*.pyc' \
@@ -146,6 +161,7 @@ jobs:
       # ── 10. Language toolchains ────────────────────────────────────────────
       - name: Capture language toolchains
         run: |
+          sudo su
           mkdir -p backup/toolchains
 
           # Java JDKs (/usr/lib/jvm)
@@ -188,6 +204,7 @@ jobs:
       # ── 11. Full home dotfiles and ~/.config ───────────────────────────────
       - name: Capture home dotfiles (actual file contents)
         run: |
+          sudo su
           mkdir -p backup/home/dotfiles
           mkdir -p backup/home/config
           mkdir -p backup/home/local-share
@@ -231,11 +248,13 @@ jobs:
 
       - name: Capture git global config
         run: |
+          sudo su
           git config --global --list 2>/dev/null > backup/home/gitconfig.txt || true
           [ -f ~/.gitignore_global ] && cp ~/.gitignore_global backup/home/ || true
 
       - name: Capture SSH config (public keys only, NO private keys)
         run: |
+          sudo su
           mkdir -p backup/ssh
           [ -f ~/.ssh/config ]      && cp ~/.ssh/config      backup/ssh/ || true
           [ -f ~/.ssh/known_hosts ] && cp ~/.ssh/known_hosts backup/ssh/ || true
@@ -246,6 +265,7 @@ jobs:
       # ── 12. Size summary ──────────────────────────────────────────────────
       - name: Print backup size breakdown
         run: |
+          sudo su
           echo "===== Backup size breakdown ====="
           sudo du -sh backup/*/  | sort -rh
           echo "================================="
@@ -254,6 +274,7 @@ jobs:
       # ── 13. Generate restore.sh ───────────────────────────────────────────
       - name: Generate restore.sh
         run: |
+          sudo su
           cat > backup/restore.sh << 'RESTORE_SCRIPT'
           #!/usr/bin/env bash
           # =============================================================================
@@ -376,6 +397,7 @@ jobs:
       # ── 14. README ─────────────────────────────────────────────────────────
       - name: Generate summary README
         run: |
+          sudo su
           cat > backup/README.md << EOF
           # Ubuntu Runner Backup
           **Created:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")
@@ -419,6 +441,7 @@ jobs:
       # ── 15. Compress ───────────────────────────────────────────────────────
       - name: Compress backup
         run: |
+          sudo su
           TIMESTAMP=$(date -u +"%Y-%m-%dT%H-%M-%SZ")
           tar -czf "ubuntu-runner-backup-${TIMESTAMP}.tar.gz" backup/
           echo "Final archive: $(du -sh ubuntu-runner-backup-${TIMESTAMP}.tar.gz | cut -f1)"
@@ -435,6 +458,7 @@ jobs:
           GDRIVE_TOKEN:          ${{ secrets.GDRIVE_TOKEN }}
           GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GDRIVE_ROOT_FOLDER_ID }}
         run: |
+          sudo su
           mkdir -p ~/.config/rclone
           cat > ~/.config/rclone/rclone.conf << EOF
           [gdrive]
@@ -447,6 +471,7 @@ jobs:
 
       - name: Upload backup to Google Drive
         run: |
+          sudo su
           rclone copy "${{ env.BACKUP_FILE }}" gdrive:github-backups \
             --drive-chunk-size 128M \
             --progress \
@@ -455,4 +480,4 @@ jobs:
 
       - name: Clean up rclone config
         if: always()
-        run: rm -f ~/.config/rclone/rclone.conf
+        run: sudo rm -f ~/.config/rclone/rclone.conf
