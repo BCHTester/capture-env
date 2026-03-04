@@ -38,15 +38,18 @@ jobs:
             rsync \
             genisoimage
 
-      # ── 2. Initialise live-build on /mnt (larger separate volume) ─────────
+      # ── 2. Initialise live-build ───────────────────────────────────────────
       - name: Initialise live-build config
         run: |
-          # /mnt is typically a separate disk on GitHub-hosted runners with more
-          # free space than /. Using it avoids running out of room during the build.
-          sudo mkdir -p /mnt/live-build
-          sudo chown "$USER:$USER" /mnt/live-build
-          cd /mnt/live-build
+          # The runner has a single 145GB root partition with ~92GB free.
+          # We build in ~/live-build under the runner home directory.
+          mkdir -p ~/live-build
+          cd ~/live-build
 
+          # Note: live-build 3.0~a57 does not support --bootloaders (plural).
+          # Dual BIOS+UEFI boot is achieved by having both grub-efi-amd64-bin
+          # and grub-pc-bin installed — live-build detects and uses both
+          # automatically when building an iso-hybrid image.
           lb config \
             --mode debian \
             --system live \
@@ -54,7 +57,6 @@ jobs:
             --archive-areas "main restricted universe multiverse" \
             --apt-recommends false \
             --binary-images iso-hybrid \
-            --bootloaders "grub-efi,syslinux" \
             --debian-installer live \
             --debian-installer-gui true \
             --memtest none \
@@ -66,13 +68,13 @@ jobs:
       # ── 3. Capture package list ────────────────────────────────────────────
       - name: Capture installed package list
         run: |
-          mkdir -p /mnt/live-build/config/package-lists
+          mkdir -p ~/live-build/config/package-lists
           # Full list of installed packages
           dpkg --get-selections | awk '$2=="install"{print $1}' | sort \
-            > /mnt/live-build/config/package-lists/runner-packages.list.chroot
+            > ~/live-build/config/package-lists/runner-packages.list.chroot
 
           # Append live system essentials that must be present for a bootable ISO
-          cat >> /mnt/live-build/config/package-lists/runner-packages.list.chroot << 'EOF'
+          cat >> ~/live-build/config/package-lists/runner-packages.list.chroot << 'EOF'
           live-boot
           live-config
           live-config-systemd
@@ -86,30 +88,30 @@ jobs:
           rsync
           EOF
 
-          echo "Package list: $(wc -l < /mnt/live-build/config/package-lists/runner-packages.list.chroot) entries"
+          echo "Package list: $(wc -l < ~/live-build/config/package-lists/runner-packages.list.chroot) entries"
 
       # ── 4. Inject apt sources and GPG keys ────────────────────────────────
       - name: Inject apt sources and GPG keys
         run: |
-          mkdir -p /mnt/live-build/config/archives
+          mkdir -p ~/live-build/config/archives
 
           # Third-party .list sources
           for f in /etc/apt/sources.list.d/*.list; do
-            [ -f "$f" ] && cp "$f" /mnt/live-build/config/archives/ || true
+            [ -f "$f" ] && cp "$f" ~/live-build/config/archives/ || true
           done
           # DEB822 .sources format
           for f in /etc/apt/sources.list.d/*.sources; do
-            [ -f "$f" ] && cp "$f" /mnt/live-build/config/archives/ || true
+            [ -f "$f" ] && cp "$f" ~/live-build/config/archives/ || true
           done
           # GPG keys
           for f in /etc/apt/trusted.gpg.d/*.gpg /etc/apt/trusted.gpg.d/*.asc; do
-            [ -f "$f" ] && cp "$f" /mnt/live-build/config/archives/ || true
+            [ -f "$f" ] && cp "$f" ~/live-build/config/archives/ || true
           done
 
       # ── 5. Stage /etc directly into includes.chroot ───────────────────────
       - name: Stage /etc into ISO rootfs
         run: |
-          INCLUDES=/mnt/live-build/config/includes.chroot
+          INCLUDES=~/live-build/config/includes.chroot
           mkdir -p "$INCLUDES/etc"
 
           # Copy full /etc, skipping only credentials and machine-specific
@@ -134,7 +136,7 @@ jobs:
       # ── 6. Stage /usr/local directly into includes.chroot ─────────────────
       - name: Stage /usr/local into ISO rootfs
         run: |
-          INCLUDES=/mnt/live-build/config/includes.chroot
+          INCLUDES=~/live-build/config/includes.chroot
           mkdir -p "$INCLUDES/usr/local"
 
           sudo rsync -a --ignore-errors \
@@ -147,7 +149,7 @@ jobs:
       # ── 7. Stage /opt directly into includes.chroot ───────────────────────
       - name: Stage /opt into ISO rootfs
         run: |
-          INCLUDES=/mnt/live-build/config/includes.chroot
+          INCLUDES=~/live-build/config/includes.chroot
           mkdir -p "$INCLUDES/opt"
 
           sudo rsync -a --ignore-errors \
@@ -160,7 +162,7 @@ jobs:
       # ── 8. Stage language toolchains ──────────────────────────────────────
       - name: Stage language toolchains into ISO rootfs
         run: |
-          INCLUDES=/mnt/live-build/config/includes.chroot
+          INCLUDES=~/live-build/config/includes.chroot
 
           # JVM — goes directly to its system path
           if [ -d /usr/lib/jvm ]; then
@@ -193,7 +195,7 @@ jobs:
       # ── 9. Stage home dotfiles and ~/.config into /etc/skel ───────────────
       - name: Stage home dotfiles into /etc/skel
         run: |
-          SKEL=/mnt/live-build/config/includes.chroot/etc/skel
+          SKEL=~/live-build/config/includes.chroot/etc/skel
 
           # All dotfiles in ~/
           find ~ -maxdepth 1 -name '.*' -type f \
@@ -228,9 +230,9 @@ jobs:
       # ── 10. Create ldconfig hook (needed after /usr/local is placed) ───────
       - name: Create chroot hook for ldconfig and PATH fixups
         run: |
-          mkdir -p /mnt/live-build/config/hooks/live
+          mkdir -p ~/live-build/config/hooks/live
 
-          cat > /mnt/live-build/config/hooks/live/0100-fixup.hook.chroot << 'HOOK'
+          cat > ~/live-build/config/hooks/live/0100-fixup.hook.chroot << 'HOOK'
           #!/bin/bash
           set -e
 
@@ -281,7 +283,7 @@ jobs:
           fi
           HOOK
 
-          chmod +x /mnt/live-build/config/hooks/live/0100-fixup.hook.chroot
+          chmod +x ~/live-build/config/hooks/live/0100-fixup.hook.chroot
 
       # ── 11. Show disk state before the expensive build step ───────────────
       - name: Show disk state before build
@@ -290,20 +292,20 @@ jobs:
           df -h
           echo ""
           echo "=== live-build includes size ==="
-          du -sh /mnt/live-build/config/includes.chroot/*/  2>/dev/null | sort -rh
+          du -sh ~/live-build/config/includes.chroot/*/  2>/dev/null | sort -rh
           echo ""
           echo "=== Total live-build tree ==="
-          du -sh /mnt/live-build/
+          du -sh ~/live-build/
 
       # ── 12. Build the ISO ──────────────────────────────────────────────────
       - name: Build ISO
-        working-directory: /mnt/live-build
+        working-directory: /home/runner/live-build
         run: |
           echo "Starting live-build — typically takes 30–90 minutes..."
           sudo lb build 2>&1 | tee /tmp/live-build.log
           echo ""
           echo "=== ISO output ==="
-          ls -lh /mnt/live-build/*.iso /mnt/live-build/live-image*.hybrid.iso 2>/dev/null
+          ls -lh ~/live-build/*.iso ~/live-build/live-image*.hybrid.iso 2>/dev/null
 
       - name: Name ISO with timestamp and verify
         run: |
@@ -311,21 +313,21 @@ jobs:
           OS_VERSION=$(lsb_release -rs 2>/dev/null || echo "24.04")
           ISO_NAME="ubuntu-runner-${OS_VERSION}-${TIMESTAMP}.iso"
 
-          ISO_SRC=$(ls /mnt/live-build/*.iso /mnt/live-build/live-image*.hybrid.iso 2>/dev/null | head -1)
+          ISO_SRC=$(ls ~/live-build/*.iso ~/live-build/live-image*.hybrid.iso 2>/dev/null | head -1)
           if [ -z "$ISO_SRC" ]; then
             echo "ERROR: No ISO file found — build may have failed. Check the build log artifact."
             exit 1
           fi
 
-          mv "$ISO_SRC" "/mnt/${ISO_NAME}"
-          ISO_SIZE=$(du -sh "/mnt/${ISO_NAME}" | cut -f1)
+          mv "$ISO_SRC" "$HOME/${ISO_NAME}"
+          ISO_SIZE=$(du -sh "$HOME/${ISO_NAME}" | cut -f1)
           echo "ISO: ${ISO_NAME}  (${ISO_SIZE})"
 
           # Generate SHA256 checksum alongside the ISO
-          sha256sum "/mnt/${ISO_NAME}" > "/mnt/${ISO_NAME}.sha256"
+          sha256sum "$HOME/${ISO_NAME}" > "$HOME/${ISO_NAME}.sha256"
 
-          echo "ISO_FILE=/mnt/${ISO_NAME}"       >> $GITHUB_ENV
-          echo "ISO_SHA=/mnt/${ISO_NAME}.sha256"  >> $GITHUB_ENV
+          echo "ISO_FILE=$HOME/${ISO_NAME}"       >> $GITHUB_ENV
+          echo "ISO_SHA=$HOME/${ISO_NAME}.sha256"  >> $GITHUB_ENV
           echo "ISO_NAME=${ISO_NAME}"             >> $GITHUB_ENV
 
       # ── 13. Upload ISO + checksum to Google Drive ─────────────────────────
