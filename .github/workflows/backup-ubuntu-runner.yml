@@ -1,0 +1,330 @@
+name: Backup Ubuntu Runner Environment
+
+on:
+  workflow_dispatch:  # Run manually whenever you want a backup
+  schedule:
+    - cron: '0 2 * * 0'  # Optional: auto-run weekly on Sundays at 2am UTC
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    # ubuntu-22.04 or ubuntu-24.04 are also valid — pin this to match your target
+    # runs-on: ubuntu-22.04
+
+    steps:
+      # ── 1. Installed packages ──────────────────────────────────────────────
+      - name: Capture installed apt packages
+        run: |
+          mkdir -p backup/packages
+          dpkg --get-selections > backup/packages/dpkg-selections.txt
+          apt-mark showmanual > backup/packages/apt-manual.txt
+          apt-mark showauto  > backup/packages/apt-auto.txt
+
+      - name: Capture snap packages
+        run: |
+          snap list --all > backup/packages/snap-list.txt 2>/dev/null || echo "(no snaps)" > backup/packages/snap-list.txt
+
+      - name: Capture pip packages (all Python versions)
+        run: |
+          for py in python3 python3.10 python3.11 python3.12; do
+            if command -v $py &>/dev/null; then
+              $py -m pip freeze 2>/dev/null > backup/packages/pip-${py}.txt || true
+            fi
+          done
+
+      - name: Capture npm global packages
+        run: |
+          npm list -g --depth=0 2>/dev/null > backup/packages/npm-global.txt || echo "(npm not found)" > backup/packages/npm-global.txt
+
+      - name: Capture gem packages (Ruby)
+        run: |
+          gem list 2>/dev/null > backup/packages/gem-list.txt || echo "(gem not found)" > backup/packages/gem-list.txt
+
+      # ── 2. System configuration ────────────────────────────────────────────
+      - name: Capture system info
+        run: |
+          mkdir -p backup/system
+          uname -a                      > backup/system/uname.txt
+          lsb_release -a               >> backup/system/uname.txt 2>/dev/null
+          cat /etc/os-release           > backup/system/os-release.txt
+          timedatectl status            > backup/system/timezone.txt 2>/dev/null || true
+          locale                        > backup/system/locale.txt
+          cat /etc/locale.gen          >> backup/system/locale.txt 2>/dev/null || true
+          cat /etc/hosts                > backup/system/hosts.txt
+          cat /etc/hostname             > backup/system/hostname.txt
+          cat /etc/resolv.conf          > backup/system/resolv.conf.txt
+
+      - name: Capture apt sources and preferences
+        run: |
+          mkdir -p backup/apt
+          cp /etc/apt/sources.list backup/apt/ 2>/dev/null || true
+          cp -r /etc/apt/sources.list.d/ backup/apt/sources.list.d/ 2>/dev/null || true
+          cp -r /etc/apt/preferences.d/ backup/apt/preferences.d/ 2>/dev/null || true
+
+      - name: Capture sysctl and kernel parameters
+        run: |
+          sysctl -a 2>/dev/null > backup/system/sysctl.txt || true
+          cat /etc/sysctl.conf  >> backup/system/sysctl.txt 2>/dev/null || true
+
+      - name: Capture mounted filesystems and disk layout
+        run: |
+          df -h        > backup/system/df.txt
+          lsblk -o NAME,SIZE,TYPE,MOUNTPOINT > backup/system/lsblk.txt
+          cat /etc/fstab > backup/system/fstab.txt
+
+      - name: Capture crontabs
+        run: |
+          mkdir -p backup/cron
+          crontab -l 2>/dev/null > backup/cron/user-crontab.txt || echo "(no user crontab)"
+          ls /etc/cron* 2>/dev/null >> backup/cron/system-cron-list.txt || true
+          cp -r /etc/cron.d/     backup/cron/cron.d/    2>/dev/null || true
+          cp -r /etc/cron.daily/ backup/cron/cron.daily/ 2>/dev/null || true
+          cp -r /etc/cron.weekly/ backup/cron/cron.weekly/ 2>/dev/null || true
+
+      # ── 3. Environment & shell configuration ──────────────────────────────
+      - name: Capture environment variables
+        run: |
+          mkdir -p backup/env
+          # Filter out secrets/tokens from the captured environment
+          env | grep -v -iE '(token|secret|key|password|credential|auth)' | sort > backup/env/environment.txt
+          echo "# WARNING: Review this file and remove any sensitive values before restoring" >> backup/env/environment.txt
+
+      - name: Capture shell config files
+        run: |
+          mkdir -p backup/env
+          for f in ~/.bashrc ~/.bash_profile ~/.bash_aliases ~/.profile \
+                   ~/.zshrc ~/.zprofile ~/.zshenv \
+                   ~/.config/fish/config.fish; do
+            [ -f "$f" ] && cp "$f" backup/env/$(basename $f) || true
+          done
+
+      - name: Capture PATH and tool versions
+        run: |
+          mkdir -p backup/env
+          echo "PATH=$PATH" > backup/env/path.txt
+          {
+            echo "=== Key tool versions ===";
+            bash --version | head -1;
+            python3 --version 2>/dev/null || true;
+            node --version 2>/dev/null || true;
+            npm --version 2>/dev/null || true;
+            ruby --version 2>/dev/null || true;
+            go version 2>/dev/null || true;
+            java -version 2>&1 | head -1 || true;
+            docker --version 2>/dev/null || true;
+            git --version 2>/dev/null || true;
+          } > backup/env/tool-versions.txt
+
+      # ── 4. Systemd services ────────────────────────────────────────────────
+      - name: Capture systemd service state
+        run: |
+          mkdir -p backup/services
+          systemctl list-units --type=service --all --no-pager > backup/services/services-all.txt 2>/dev/null || true
+          systemctl list-units --type=service --state=enabled --no-pager > backup/services/services-enabled.txt 2>/dev/null || true
+          # Copy any custom unit files (not stock systemd units)
+          mkdir -p backup/services/custom-units
+          cp /etc/systemd/system/*.service backup/services/custom-units/ 2>/dev/null || true
+
+      # ── 5. Users and groups ────────────────────────────────────────────────
+      - name: Capture users and groups
+        run: |
+          mkdir -p backup/users
+          cat /etc/passwd  > backup/users/passwd.txt
+          cat /etc/group   > backup/users/group.txt
+          cat /etc/shadow  > backup/users/shadow.txt 2>/dev/null || echo "(no read access to shadow)" > backup/users/shadow.txt
+
+      # ── 6. Network configuration ───────────────────────────────────────────
+      - name: Capture network config
+        run: |
+          mkdir -p backup/network
+          ip addr show   > backup/network/ip-addr.txt
+          ip route show  > backup/network/ip-route.txt
+          ss -tuln       > backup/network/open-ports.txt
+          cat /etc/netplan/*.yaml > backup/network/netplan.yaml 2>/dev/null || true
+
+      # ── 7. Home directory structure & dot-files ────────────────────────────
+      - name: Capture home directory structure (no file contents)
+        run: |
+          mkdir -p backup/home
+          find ~ -maxdepth 4 -not -path '*/\.git/*' > backup/home/file-tree.txt
+
+      - name: Capture git global config
+        run: |
+          git config --global --list 2>/dev/null > backup/home/gitconfig.txt || true
+          [ -f ~/.gitignore_global ] && cp ~/.gitignore_global backup/home/ || true
+
+      - name: Capture SSH config (public keys only, NO private keys)
+        run: |
+          mkdir -p backup/ssh
+          [ -f ~/.ssh/config ]     && cp ~/.ssh/config backup/ssh/ || true
+          [ -f ~/.ssh/known_hosts ] && cp ~/.ssh/known_hosts backup/ssh/ || true
+          # Public keys only!
+          for pub in ~/.ssh/*.pub; do
+            [ -f "$pub" ] && cp "$pub" backup/ssh/ || true
+          done
+
+      # ── 8. Generate restore script ────────────────────────────────────────
+      - name: Generate restore.sh
+        run: |
+          cat > backup/restore.sh << 'RESTORE_SCRIPT'
+          #!/usr/bin/env bash
+          # =============================================================================
+          # restore.sh — Restore a GitHub Actions Ubuntu runner backup to a local machine
+          # Run as: sudo bash restore.sh
+          # =============================================================================
+          set -euo pipefail
+          SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          BACKUP_DIR="$SCRIPT_DIR"
+
+          echo "==> [1/7] Restoring apt package selections..."
+          if [ -f "$BACKUP_DIR/packages/dpkg-selections.txt" ]; then
+            apt-get update -qq
+            dpkg --set-selections < "$BACKUP_DIR/packages/dpkg-selections.txt"
+            apt-get -y dselect-upgrade
+          fi
+
+          echo "==> [2/7] Restoring apt sources..."
+          if [ -d "$BACKUP_DIR/apt/sources.list.d" ]; then
+            cp "$BACKUP_DIR/apt/sources.list" /etc/apt/sources.list 2>/dev/null || true
+            cp -r "$BACKUP_DIR/apt/sources.list.d/." /etc/apt/sources.list.d/ 2>/dev/null || true
+            apt-get update -qq
+          fi
+
+          echo "==> [3/7] Restoring pip packages..."
+          for pip_file in "$BACKUP_DIR"/packages/pip-*.txt; do
+            [ -f "$pip_file" ] || continue
+            py=$(basename "$pip_file" .txt | sed 's/pip-//')
+            echo "    Installing pip packages for $py..."
+            $py -m pip install -r "$pip_file" --quiet 2>/dev/null || true
+          done
+
+          echo "==> [4/7] Restoring npm global packages..."
+          if [ -f "$BACKUP_DIR/packages/npm-global.txt" ]; then
+            grep -v '^/' "$BACKUP_DIR/packages/npm-global.txt" | grep '@' | \
+              awk '{print $2}' | xargs npm install -g --quiet 2>/dev/null || true
+          fi
+
+          echo "==> [5/7] Restoring shell config files..."
+          TARGET_USER="${SUDO_USER:-$USER}"
+          TARGET_HOME=$(eval echo "~$TARGET_USER")
+          for f in "$BACKUP_DIR"/env/.*; do
+            fname=$(basename "$f")
+            case "$fname" in
+              .bashrc|.bash_profile|.bash_aliases|.profile|.zshrc|.zprofile|.zshenv)
+                echo "    Restoring $fname (backing up existing first)..."
+                [ -f "$TARGET_HOME/$fname" ] && cp "$TARGET_HOME/$fname" "$TARGET_HOME/${fname}.bak"
+                cp "$f" "$TARGET_HOME/$fname"
+                chown "$TARGET_USER:$TARGET_USER" "$TARGET_HOME/$fname"
+                ;;
+            esac
+          done
+
+          echo "==> [6/7] Restoring git config..."
+          if [ -f "$BACKUP_DIR/home/gitconfig.txt" ]; then
+            echo "    Review $BACKUP_DIR/home/gitconfig.txt and apply manually with: git config --global ..."
+          fi
+
+          echo "==> [7/7] Restoring SSH config and known_hosts..."
+          if [ -d "$BACKUP_DIR/ssh" ]; then
+            mkdir -p "$TARGET_HOME/.ssh"
+            [ -f "$BACKUP_DIR/ssh/config" ]      && cp "$BACKUP_DIR/ssh/config"      "$TARGET_HOME/.ssh/"
+            [ -f "$BACKUP_DIR/ssh/known_hosts" ] && cp "$BACKUP_DIR/ssh/known_hosts" "$TARGET_HOME/.ssh/"
+            for pub in "$BACKUP_DIR/ssh/"*.pub; do
+              [ -f "$pub" ] && cp "$pub" "$TARGET_HOME/.ssh/"
+            done
+            chown -R "$TARGET_USER:$TARGET_USER" "$TARGET_HOME/.ssh"
+            chmod 700 "$TARGET_HOME/.ssh"
+            chmod 600 "$TARGET_HOME/.ssh/"* 2>/dev/null || true
+          fi
+
+          echo ""
+          echo "✅ Restore complete!"
+          echo ""
+          echo "Manual follow-up steps:"
+          echo "  1. Review backup/env/environment.txt and re-export any needed vars in ~/.bashrc"
+          echo "  2. Review backup/services/services-enabled.txt and enable any needed systemd services"
+          echo "  3. Re-add any SSH private keys manually (they were NOT backed up)"
+          echo "  4. Re-enter git credentials if needed"
+          RESTORE_SCRIPT
+          chmod +x backup/restore.sh
+
+      # ── 9. Generate a human-readable summary ──────────────────────────────
+      - name: Generate summary README
+        run: |
+          cat > backup/README.md << EOF
+          # Ubuntu Runner Backup
+          **Created:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          **Runner OS:** $(lsb_release -ds 2>/dev/null || uname -r)
+          **Kernel:** $(uname -r)
+
+          ## Contents
+          | Folder | What's inside |
+          |--------|--------------|
+          | packages/ | apt, pip, npm, snap, gem package lists |
+          | system/ | OS info, sysctl, disk layout, fstab, hosts |
+          | apt/ | apt sources and preferences |
+          | env/ | Shell configs, environment variables, PATH, tool versions |
+          | services/ | systemd service state + custom unit files |
+          | users/ | /etc/passwd and /etc/group |
+          | network/ | IP addresses, routes, open ports, netplan |
+          | home/ | File tree, git config, SSH config & public keys |
+          | cron/ | Crontabs and cron.d files |
+          | restore.sh | Automated restore script |
+
+          ## How to Restore
+          \`\`\`bash
+          # 1. Download and extract the backup artifact from GitHub Actions
+          unzip backup.zip -d ~/restore
+          cd ~/restore
+
+          # 2. Run the restore script (requires sudo)
+          sudo bash restore.sh
+          \`\`\`
+
+          ## ⚠️ Notes
+          - **No private SSH keys** were captured (by design — never store these in CI artifacts)
+          - **No secrets/tokens** — review env/environment.txt before applying
+          - The restore script installs packages but won't overwrite system files destructively
+          - Systemd services must be re-enabled manually (see services/services-enabled.txt)
+          EOF
+
+      # ── 10. Compress backup ────────────────────────────────────────────────
+      - name: Compress backup
+        run: |
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H-%M-%SZ")
+          tar -czf "ubuntu-runner-backup-${TIMESTAMP}.tar.gz" backup/
+          echo "BACKUP_FILE=ubuntu-runner-backup-${TIMESTAMP}.tar.gz" >> $GITHUB_ENV
+
+      # ── 11. Upload to Google Drive via rclone ──────────────────────────────
+      - name: Install rclone
+        run: curl https://rclone.org/install.sh | sudo bash
+
+      - name: Configure rclone for Google Drive
+        env:
+          GDRIVE_CLIENT_ID:     ${{ secrets.GDRIVE_CLIENT_ID }}
+          GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+          GDRIVE_TOKEN:         ${{ secrets.GDRIVE_TOKEN }}
+          GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GDRIVE_ROOT_FOLDER_ID }}  # optional
+        run: |
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf << EOF
+          [gdrive]
+          type = drive
+          client_id = ${GDRIVE_CLIENT_ID}
+          client_secret = ${GDRIVE_CLIENT_SECRET}
+          token = ${GDRIVE_TOKEN}
+          root_folder_id = ${GDRIVE_ROOT_FOLDER_ID}
+          EOF
+
+      - name: Upload backup to Google Drive
+        run: |
+          # Uploads to a "github-backups" folder in your Drive root (or root_folder_id)
+          rclone copy "${{ env.BACKUP_FILE }}" gdrive:github-backups \
+            --drive-chunk-size 128M \
+            --progress \
+            --stats-one-line
+          echo "✅ Uploaded ${{ env.BACKUP_FILE }} to Google Drive → github-backups/"
+
+      - name: Clean up rclone config (removes secrets from runner)
+        if: always()
+        run: rm -f ~/.config/rclone/rclone.conf
