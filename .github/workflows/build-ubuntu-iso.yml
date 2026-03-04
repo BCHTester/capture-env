@@ -44,6 +44,16 @@ jobs:
             --iso-volume "Ubuntu-Runner-Backup" \
             --compression xz
 
+      # ── 2b. Disable syslinux (obsolete theme packages removed from Noble) ──
+      - name: Disable syslinux bootloader
+        run: |
+          # syslinux-themes-ubuntu-oneiric and gfxboot-theme-ubuntu no longer
+          # exist in Ubuntu Noble. Disable syslinux entirely; grub handles both
+          # BIOS and UEFI boot on an iso-hybrid image.
+          sed -i 's/^LB_SYSLINUX=.*/LB_SYSLINUX="false"/' ~/live-build/config/binary
+          grep LB_SYSLINUX ~/live-build/config/binary || echo 'LB_SYSLINUX="false"' >> ~/live-build/config/binary
+          echo "syslinux disabled"
+
       # ── 3. Inject package list ─────────────────────────────────────────────
       # Dump all installed packages and let live-build's apt resolve what is
       # actually available in the Ubuntu archive. Packages from third-party
