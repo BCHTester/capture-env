@@ -301,13 +301,13 @@ jobs:
         run: |
           sudo su
           echo "=== Disk layout ==="
-          df -h
+          sudo df -h
           echo ""
           echo "=== live-build includes size ==="
-          du -sh ~/live-build/config/includes.chroot/*/  2>/dev/null | sort -rh
+          sudo du -sh ~/live-build/config/includes.chroot/*/  2>/dev/null | sort -rh
           echo ""
           echo "=== Total live-build tree ==="
-          du -sh ~/live-build/
+          sudo du -sh ~/live-build/
 
       # ── 12. Build the ISO ──────────────────────────────────────────────────
       - name: Build ISO
