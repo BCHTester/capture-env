@@ -1,4 +1,4 @@
-name: Build Bootable Ubuntu ISO v5
+name: Build Bootable Ubuntu ISO v6
 
 on:
   workflow_dispatch:
@@ -56,7 +56,6 @@ jobs:
             --distribution noble \
             --archive-areas "main restricted universe multiverse" \
             --apt-recommends false \
-            --apt-options "--allow-insecure-repositories --allow-unauthenticated" \
             --binary-images iso-hybrid \
             --debian-installer live \
             --debian-installer-gui true \
@@ -137,6 +136,16 @@ jobs:
         run: |
           INCLUDES=~/live-build/config/includes.chroot
           mkdir -p "$INCLUDES/etc"
+
+          # Write apt config to allow unauthenticated repos BEFORE staging /etc,
+          # so it's present in the chroot before apt runs at all.
+          # This handles third-party repos (Microsoft etc.) with key issues.
+          mkdir -p "$INCLUDES/etc/apt/apt.conf.d"
+          cat > "$INCLUDES/etc/apt/apt.conf.d/99-live-build-insecure" << 'APTCONF'
+APT::Get::AllowUnauthenticated "true";
+Acquire::AllowInsecureRepositories "true";
+Acquire::AllowDowngradeToInsecureRepositories "true";
+APTCONF
 
           # Copy full /etc, skipping only credentials and machine-specific
           # network config that would break a different machine
