@@ -47,40 +47,18 @@ jobs:
       # ── 2b. Disable syslinux (obsolete theme packages removed from Noble) ──
       - name: Disable syslinux bootloader
         run: |
-          # syslinux-themes-ubuntu-oneiric and gfxboot-theme-ubuntu were removed
-          # from Ubuntu Noble. Replace live-build's syslinux script with a no-op
-          # so it is skipped entirely. Grub handles both BIOS and UEFI boot.
-          # Use Python to write the script so newlines are real newlines.
-          python3 - << 'PYEOF'
-          import subprocess, os, stat
-          result = subprocess.run(
-              ['find', '/usr/lib/live/build/', '-name', 'binary_syslinux'],
-              capture_output=True, text=True
-          )
-          # Also check the scripts dir used by some live-build versions
-          result2 = subprocess.run(
-              ['find', '/usr/share/live/build/', '-name', '*syslinux*'],
-              capture_output=True, text=True
-          )
-          paths = [p for p in (result.stdout.strip() + '\n' + result2.stdout.strip()).split('\n') if p.strip()]
-          if not paths:
-              # Hard-code the known path as fallback
-              paths = ['/usr/lib/live/build/binary_syslinux']
-          noop = '#!/bin/sh\necho "P: Skipping syslinux (disabled, not available in Noble)"\nexit 0\n'
-          for p in paths:
-              if os.path.exists(p):
-                  subprocess.run(['cp', p, p + '.bak'])
-                  with open(p, 'w') as f:
-                      f.write(noop)
-                  os.chmod(p, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
-                  print('Patched:', p)
-              else:
-                  # Write it anyway so live-build finds a working script
-                  os.makedirs(os.path.dirname(p), exist_ok=True)
-                  with open(p, 'w') as f:
-                      f.write(noop)
-                  os.chmod(p, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
-                  print('Created:', p)
+          # The script /usr/lib/live/build/binary_syslinux tries to install
+          # syslinux-themes-ubuntu-oneiric and gfxboot-theme-ubuntu which no
+          # longer exist in Noble. Overwrite it with a no-op using Python so
+          # newlines are real newlines (shell printf/echo are unreliable here).
+          sudo python3 - << 'PYEOF'
+          import os, stat
+          path = '/usr/lib/live/build/binary_syslinux'
+          noop = '#!/bin/sh\necho "P: Skipping syslinux (not available in Noble)"\nexit 0\n'
+          with open(path, 'w') as f:
+              f.write(noop)
+          os.chmod(path, 0o755)
+          print('Patched:', path)
           PYEOF
 
       # ── 3. Inject package list ─────────────────────────────────────────────
